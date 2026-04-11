@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets.ionogram_manifest import IonogramManifestDataset
-from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
+from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast, validate_hybrid_sequence_lengths
 
 
 def parse_args():
@@ -83,8 +83,33 @@ def resolve_saved_first(saved_args: dict, key: str, cli_value, default):
     return default
 
 
+def validate_dataset_sequence_lengths(dataset, in_T: int, out_T: int, arch: str):
+    if len(dataset) == 0:
+        return
+
+    sample = dataset[0]
+    sample_in_T = int(sample["x"].shape[0])
+    sample_out_T = int(sample["y"].shape[0])
+
+    if arch == "hybrid_unet_facts" and sample_in_T != sample_out_T:
+        raise ValueError(
+            f"Dataset provides input/target lengths ({sample_in_T}, {sample_out_T}), but "
+            "HybridUNetFacTS requires equal-length input/output because its translator is an "
+            "equal-length hidden-state transform without an explicit temporal projection head."
+        )
+
+    if sample_in_T != in_T or sample_out_T != out_T:
+        raise ValueError(
+            f"Dataset provides input/target lengths ({sample_in_T}, {sample_out_T}), but "
+            f"the current configuration expects ({in_T}, {out_T})."
+        )
+
+
 def main():
     args = parse_args()
+    if args.arch == "hybrid_unet_facts" and args.in_T is not None and args.out_T is not None:
+        validate_hybrid_sequence_lengths(args.arch, args.in_T, args.out_T)
+
     ckpt_path = Path(args.checkpoint)
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     saved_args = checkpoint.get("args", {})
@@ -94,6 +119,7 @@ def main():
     in_T = resolve_saved_first(saved_args, "in_T", args.in_T, 8)
     out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
     arch = resolve_override(args.arch, saved_args, "arch", "simvp")
+    validate_hybrid_sequence_lengths(arch, in_T, out_T)
     channels = 1 if image_mode == "L" else 3
 
     if torch.cuda.is_available() and args.device.startswith("cuda"):
@@ -101,12 +127,6 @@ def main():
     else:
         device = torch.device("cpu")
     amp_enabled = args.amp and device.type == "cuda"
-
-    if arch == "hybrid_unet_facts" and out_T != in_T:
-        print(
-            "hybrid_unet_facts uses an equal-length backbone and will truncate decoded frames "
-            f"from {in_T} to {out_T} at the wrapper output."
-        )
 
     model = SimVPForecast(
         in_T=in_T,
@@ -135,6 +155,7 @@ def main():
         image_mode=image_mode,
         image_size=image_size,
     )
+    validate_dataset_sequence_lengths(dataset, in_T, out_T, arch)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

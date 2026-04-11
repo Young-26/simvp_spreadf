@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 from datasets.ionogram_manifest import IonogramManifestDataset
-from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
+from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast, validate_hybrid_sequence_lengths
 from utils.seed import set_seed
 
 
@@ -56,6 +56,28 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     return parser.parse_args()
+
+
+def validate_dataset_sequence_lengths(dataset, split_name: str, in_T: int, out_T: int, arch: str):
+    if len(dataset) == 0:
+        return
+
+    sample = dataset[0]
+    sample_in_T = int(sample["x"].shape[0])
+    sample_out_T = int(sample["y"].shape[0])
+
+    if arch == "hybrid_unet_facts" and sample_in_T != sample_out_T:
+        raise ValueError(
+            f"{split_name} dataset provides input/target lengths ({sample_in_T}, {sample_out_T}), "
+            "but HybridUNetFacTS requires equal-length input/output because its translator is an "
+            "equal-length hidden-state transform without an explicit temporal projection head."
+        )
+
+    if sample_in_T != in_T or sample_out_T != out_T:
+        raise ValueError(
+            f"{split_name} dataset provides input/target lengths ({sample_in_T}, {sample_out_T}), "
+            f"but the current configuration expects ({in_T}, {out_T})."
+        )
 
 
 def collate_fn(batch):
@@ -309,6 +331,7 @@ def write_report(report_path, status, reason, total_epochs, completed_epochs, be
 
 def main():
     args = parse_args()
+    validate_hybrid_sequence_lengths(args.arch, args.in_T, args.out_T)
 
     use_ddp, rank, world_size, local_rank = setup_distributed()
     set_seed(args.seed + rank)
@@ -346,11 +369,8 @@ def main():
     if is_main_process():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
-        if args.arch == "hybrid_unet_facts" and args.out_T != args.in_T:
-            logger.info(
-                "hybrid_unet_facts uses an equal-length backbone and will truncate decoded frames "
-                f"from {args.in_T} to {args.out_T} at the wrapper output."
-            )
+        if args.arch == "hybrid_unet_facts":
+            logger.info("hybrid_unet_facts requires equal-length input/output and has no temporal projection head.")
 
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
@@ -366,6 +386,9 @@ def main():
     if is_main_process():
         logger.info(f"train_samples: {len(train_set)}")
         logger.info(f"val_samples: {len(val_set)}")
+
+    validate_dataset_sequence_lengths(train_set, "train", args.in_T, args.out_T, args.arch)
+    validate_dataset_sequence_lengths(val_set, "val", args.in_T, args.out_T, args.arch)
 
     channels = 1 if args.image_mode == "L" else 3
 
