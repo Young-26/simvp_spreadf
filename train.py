@@ -362,7 +362,10 @@ def main():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
         if args.arch == "hybrid_unet_facts":
-            logger.info("hybrid_unet_facts uses a strict Fac-T-S translator plus future forecasting heads.")
+            logger.info(
+                "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
+                "and lightweight temporal-conv skip forecasters."
+            )
 
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,

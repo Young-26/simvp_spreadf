@@ -380,6 +380,11 @@ class FutureCrossAttentionHead(nn.Module):
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = SwiGLUFeedForward(dim=dim, hidden_dim=int(dim * ffn_ratio), dropout=ffn_dropout)
         self.ffn_drop = DropPath(drop_path)
+        self.register_buffer(
+            "future_temporal_pos_embed",
+            sinusoidal_embedding(out_T, dim),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, num_frames, channels, height, width = x.shape
@@ -391,10 +396,95 @@ class FutureCrossAttentionHead(nn.Module):
         # Each spatial location keeps its own temporal memory:
         # [B, T, C, H, W] -> [B * H * W, T, C]
         memory = x.permute(0, 3, 4, 1, 2).reshape(batch_size * height * width, num_frames, channels)
-        queries = self.query_embed.expand(memory.size(0), -1, -1)
+        queries = self.query_embed + self.future_temporal_pos_embed.to(dtype=memory.dtype)
+        queries = queries.expand(memory.size(0), -1, -1)
 
         future = queries + self.cross_drop(self.cross_attn(self.query_norm(queries), self.memory_norm(memory)))
         future = future + self.ffn_drop(self.ffn(self.ffn_norm(future)))
+
+        # [B * H * W, out_T, C] -> [B, out_T, C, H, W]
+        future = future.reshape(batch_size, height, width, self.out_T, channels).permute(0, 3, 4, 1, 2)
+        return future
+
+
+class TemporalConvForecastHead(nn.Module):
+    def __init__(
+        self,
+        in_T: int,
+        out_T: int,
+        dim: int,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if in_T <= 0 or out_T <= 0:
+            raise ValueError(f"TemporalConvForecastHead expects positive in_T/out_T, got {in_T}, {out_T}.")
+        if kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be odd, but got {kernel_size}.")
+
+        self.in_T = in_T
+        self.out_T = out_T
+        self.dim = dim
+
+        self.input_norm = nn.LayerNorm(dim)
+        self.depthwise_temporal = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=dim,
+            bias=False,
+        )
+        self.pointwise_temporal = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
+        self.temporal_act = nn.SiLU()
+
+        self.context_norm = nn.LayerNorm(dim * 2)
+        self.context_proj = nn.Linear(dim * 2, dim)
+        self.future_bias = nn.Parameter(torch.zeros(1, out_T, dim))
+        self.future_norm = nn.LayerNorm(dim)
+        self.future_mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+        self.register_buffer(
+            "past_temporal_pos_embed",
+            sinusoidal_embedding(in_T, dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "future_temporal_pos_embed",
+            sinusoidal_embedding(out_T, dim),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, num_frames, channels, height, width = x.shape
+        if num_frames != self.in_T:
+            raise ValueError(f"Expected {self.in_T} temporal tokens, but got {num_frames}.")
+        if channels != self.dim:
+            raise ValueError(f"Expected channel dim {self.dim}, but got {channels}.")
+
+        # Lightweight skip forecasting:
+        # [B, T, C, H, W] -> [B * H * W, T, C]
+        tokens = x.permute(0, 3, 4, 1, 2).reshape(batch_size * height * width, num_frames, channels)
+        tokens = tokens + self.past_temporal_pos_embed.to(dtype=tokens.dtype)
+        tokens = self.input_norm(tokens)
+
+        history = tokens.transpose(1, 2)  # [B * H * W, C, T]
+        history = self.depthwise_temporal(history)
+        history = self.temporal_act(history)
+        history = self.pointwise_temporal(history)
+        history = self.temporal_act(history)
+
+        mean_context = history.mean(dim=-1)
+        last_context = history[..., -1]
+        context = torch.cat([mean_context, last_context], dim=-1)
+        context = self.context_proj(self.context_norm(context))
+
+        future = context.unsqueeze(1) + self.future_bias + self.future_temporal_pos_embed.to(dtype=context.dtype)
+        future = future + self.future_mlp(self.future_norm(future))
 
         # [B * H * W, out_T, C] -> [B, out_T, C, H, W]
         future = future.reshape(batch_size, height, width, self.out_T, channels).permute(0, 3, 4, 1, 2)
@@ -497,20 +587,14 @@ class HybridUNetFacTS(nn.Module):
             ffn_dropout=ffn_dropout,
             drop_path=drop_path,
         )
-
-        skip_head_heads = max(1, heads // 2)
-        skip_ffn_ratio = max(1.5, min(ffn_ratio, 2.0))
         self.skip_future_heads = nn.ModuleList(
             [
-                FutureCrossAttentionHead(
+                TemporalConvForecastHead(
                     in_T=in_T,
                     out_T=out_T,
                     dim=skip_dim,
-                    heads=_resolve_num_heads(skip_dim, skip_head_heads),
-                    attn_dropout=attn_dropout,
-                    ffn_ratio=skip_ffn_ratio,
-                    ffn_dropout=ffn_dropout,
-                    drop_path=drop_path,
+                    kernel_size=3,
+                    dropout=ffn_dropout,
                 )
                 for skip_dim in self.stage_dims[:-1]
             ]
