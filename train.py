@@ -13,10 +13,9 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-from skimage.metrics import structural_similarity as ssim
 
 from datasets.ionogram_manifest import IonogramManifestDataset
-from simvp.wrapper import SimVPForecast
+from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
 
 
@@ -41,6 +40,13 @@ def parse_args():
     parser.add_argument("--hid_T", type=int, default=128)
     parser.add_argument("--N_S", type=int, default=4)
     parser.add_argument("--N_T", type=int, default=4)
+    parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
+    parser.add_argument("--hybrid_depth", type=int, default=2)
+    parser.add_argument("--hybrid_heads", type=int, default=8)
+    parser.add_argument("--hybrid_ffn_ratio", type=float, default=4.0)
+    parser.add_argument("--hybrid_attn_dropout", type=float, default=0.1)
+    parser.add_argument("--hybrid_ffn_dropout", type=float, default=0.1)
+    parser.add_argument("--hybrid_drop_path", type=float, default=0.1)
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
@@ -189,6 +195,8 @@ def batch_ssim_sum(pred, target, data_range=1.0):
     这样方便跨卡 all_reduce 后再除总样本数
     pred, target: [B, T, C, H, W]
     """
+    from skimage.metrics import structural_similarity as ssim
+
     pred_np = pred.detach().float().cpu().numpy()
     target_np = target.detach().float().cpu().numpy()
 
@@ -315,6 +323,7 @@ def main():
 
         logger.info("Starting training")
         logger.info(f"save_dir: {args.save_dir}")
+        logger.info(f"arch: {args.arch}")
         logger.info(f"train_manifest: {args.train_manifest}")
         logger.info(f"val_manifest: {args.val_manifest}")
         logger.info(f"use_ddp: {use_ddp}")
@@ -399,6 +408,13 @@ def main():
         hid_T=args.hid_T,
         N_S=args.N_S,
         N_T=args.N_T,
+        arch=args.arch,
+        hybrid_depth=args.hybrid_depth,
+        hybrid_heads=args.hybrid_heads,
+        hybrid_ffn_ratio=args.hybrid_ffn_ratio,
+        hybrid_attn_dropout=args.hybrid_attn_dropout,
+        hybrid_ffn_dropout=args.hybrid_ffn_dropout,
+        hybrid_drop_path=args.hybrid_drop_path,
     ).to(device)
 
     if use_ddp:
