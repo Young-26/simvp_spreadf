@@ -13,6 +13,13 @@ def _make_group_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
     return nn.GroupNorm(groups, num_channels)
 
 
+def _resolve_num_heads(dim: int, preferred_heads: int) -> int:
+    heads = min(preferred_heads, dim)
+    while dim % heads != 0 and heads > 1:
+        heads -= 1
+    return heads
+
+
 def sinusoidal_embedding(length: int, dim: int) -> torch.Tensor:
     if length <= 0 or dim <= 0:
         raise ValueError(f"Sinusoidal embedding expects positive length and dim, got {length}, {dim}.")
@@ -182,6 +189,45 @@ class MultiHeadSelfAttention(nn.Module):
         return x
 
 
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(self, dim: int, heads: int, attn_dropout: float):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by heads={heads}.")
+
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_dropout = nn.Dropout(attn_dropout)
+
+    def forward(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        batch_size, query_len, dim = query.shape
+        memory_len = memory.shape[1]
+
+        q = self.q_proj(query).reshape(batch_size, query_len, self.heads, self.head_dim)
+        k = self.k_proj(memory).reshape(batch_size, memory_len, self.heads, self.head_dim)
+        v = self.v_proj(memory).reshape(batch_size, memory_len, self.heads, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
+
+        x = torch.matmul(attn, v)
+        x = x.transpose(1, 2).reshape(batch_size, query_len, dim)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+        return x
+
+
 class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, dropout: float):
         super().__init__()
@@ -294,7 +340,7 @@ class StrictFacTSTranslator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, num_frames, channels, height, width = x.shape
 
-        # PredFormer-style Fac-T-S:
+        # Strict PredFormer-style Fac-T-S:
         # [B, T, C, H, W] -> [B * H * W, T, C]
         temporal_tokens = x.permute(0, 3, 4, 1, 2).reshape(batch_size * height * width, num_frames, channels)
         temporal_tokens = self.temporal_transformer(temporal_tokens)
@@ -305,6 +351,54 @@ class StrictFacTSTranslator(nn.Module):
         spatial_tokens = self.spatial_transformer(spatial_tokens)
         x = spatial_tokens.reshape(batch_size, num_frames, height, width, channels).permute(0, 1, 4, 2, 3)
         return x
+
+
+class FutureCrossAttentionHead(nn.Module):
+    def __init__(
+        self,
+        in_T: int,
+        out_T: int,
+        dim: int,
+        heads: int,
+        attn_dropout: float = 0.1,
+        ffn_ratio: float = 2.0,
+        ffn_dropout: float = 0.1,
+        drop_path: float = 0.0,
+    ):
+        super().__init__()
+        if in_T <= 0 or out_T <= 0:
+            raise ValueError(f"FutureCrossAttentionHead expects positive in_T/out_T, got {in_T}, {out_T}.")
+
+        self.in_T = in_T
+        self.out_T = out_T
+        self.dim = dim
+        self.query_embed = nn.Parameter(torch.randn(1, out_T, dim) * (dim ** -0.5))
+        self.query_norm = nn.LayerNorm(dim)
+        self.memory_norm = nn.LayerNorm(dim)
+        self.cross_attn = MultiHeadCrossAttention(dim=dim, heads=heads, attn_dropout=attn_dropout)
+        self.cross_drop = DropPath(drop_path)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = SwiGLUFeedForward(dim=dim, hidden_dim=int(dim * ffn_ratio), dropout=ffn_dropout)
+        self.ffn_drop = DropPath(drop_path)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, num_frames, channels, height, width = x.shape
+        if num_frames != self.in_T:
+            raise ValueError(f"Expected {self.in_T} temporal tokens, but got {num_frames}.")
+        if channels != self.dim:
+            raise ValueError(f"Expected channel dim {self.dim}, but got {channels}.")
+
+        # Each spatial location keeps its own temporal memory:
+        # [B, T, C, H, W] -> [B * H * W, T, C]
+        memory = x.permute(0, 3, 4, 1, 2).reshape(batch_size * height * width, num_frames, channels)
+        queries = self.query_embed.expand(memory.size(0), -1, -1)
+
+        future = queries + self.cross_drop(self.cross_attn(self.query_norm(queries), self.memory_norm(memory)))
+        future = future + self.ffn_drop(self.ffn(self.ffn_norm(future)))
+
+        # [B * H * W, out_T, C] -> [B, out_T, C, H, W]
+        future = future.reshape(batch_size, height, width, self.out_T, channels).permute(0, 3, 4, 1, 2)
+        return future
 
 
 class FrameEncoder(nn.Module):
@@ -354,7 +448,7 @@ class HybridUNetFacTS(nn.Module):
     def __init__(
         self,
         in_T: int = 8,
-        out_T: int = 8,
+        out_T: int = 2,
         in_channels: int = 3,
         height: int = 448,
         width: int = 448,
@@ -371,11 +465,8 @@ class HybridUNetFacTS(nn.Module):
             raise ValueError("HybridUNetFacTS expects image height and width to be divisible by 32.")
         if depth < 1:
             raise ValueError(f"depth must be >= 1, but got {depth}.")
-        if in_T != out_T:
-            raise ValueError(
-                "HybridUNetFacTS only supports equal-length input/output because its translator "
-                f"is a recurrent-free hidden-state transform. Received in_T={in_T}, out_T={out_T}."
-            )
+        if in_T <= 0 or out_T <= 0:
+            raise ValueError(f"HybridUNetFacTS expects positive in_T/out_T, got {in_T}, {out_T}.")
 
         self.in_T = in_T
         self.out_T = out_T
@@ -390,11 +481,39 @@ class HybridUNetFacTS(nn.Module):
         self.translator = StrictFacTSTranslator(
             dim=self.stage_dims[-1],
             depth=depth,
-            heads=heads,
+            heads=_resolve_num_heads(self.stage_dims[-1], heads),
             ffn_ratio=ffn_ratio,
             attn_dropout=attn_dropout,
             ffn_dropout=ffn_dropout,
             drop_path=drop_path,
+        )
+        self.bottleneck_future_head = FutureCrossAttentionHead(
+            in_T=in_T,
+            out_T=out_T,
+            dim=self.stage_dims[-1],
+            heads=_resolve_num_heads(self.stage_dims[-1], heads),
+            attn_dropout=attn_dropout,
+            ffn_ratio=max(2.0, ffn_ratio / 2.0),
+            ffn_dropout=ffn_dropout,
+            drop_path=drop_path,
+        )
+
+        skip_head_heads = max(1, heads // 2)
+        skip_ffn_ratio = max(1.5, min(ffn_ratio, 2.0))
+        self.skip_future_heads = nn.ModuleList(
+            [
+                FutureCrossAttentionHead(
+                    in_T=in_T,
+                    out_T=out_T,
+                    dim=skip_dim,
+                    heads=_resolve_num_heads(skip_dim, skip_head_heads),
+                    attn_dropout=attn_dropout,
+                    ffn_ratio=skip_ffn_ratio,
+                    ffn_dropout=ffn_dropout,
+                    drop_path=drop_path,
+                )
+                for skip_dim in self.stage_dims[:-1]
+            ]
         )
         self.decoder = FrameDecoder(stage_dims=self.stage_dims, out_channels=in_channels)
 
@@ -410,12 +529,6 @@ class HybridUNetFacTS(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.in_T != self.out_T:
-            raise RuntimeError(
-                "HybridUNetFacTS forward requires in_T == out_T. "
-                f"Configured values are in_T={self.in_T}, out_T={self.out_T}."
-            )
-
         batch_size, num_frames, channels, height, width = x.shape
         if num_frames != self.in_T:
             raise ValueError(f"Expected {self.in_T} input frames, but got {num_frames}.")
@@ -445,17 +558,24 @@ class HybridUNetFacTS(nn.Module):
         bottleneck = bottleneck + self.spatial_pos_embed.to(dtype=bottleneck.dtype)
         bottleneck = self.translator(bottleneck)
 
-        bottleneck = bottleneck.reshape(
-            batch_size * num_frames,
+        # Translator keeps equal-length hidden states. Future forecasting starts here.
+        future_bottleneck = self.bottleneck_future_head(bottleneck)
+        future_skips = [
+            head(skip)
+            for head, skip in zip(self.skip_future_heads, skips)
+        ]
+
+        future_bottleneck = future_bottleneck.reshape(
+            batch_size * self.out_T,
             self.stage_dims[-1],
             self.bottleneck_height,
             self.bottleneck_width,
         )
         decoded_skips = [
-            skip.reshape(batch_size * num_frames, skip.size(2), skip.size(3), skip.size(4))
-            for skip in skips
+            skip.reshape(batch_size * self.out_T, skip.size(2), skip.size(3), skip.size(4))
+            for skip in future_skips
         ]
 
-        y = self.decoder(bottleneck, decoded_skips)
-        y = y.reshape(batch_size, num_frames, self.in_channels, height, width)
+        y = self.decoder(future_bottleneck, decoded_skips)
+        y = y.reshape(batch_size, self.out_T, self.in_channels, height, width)
         return y

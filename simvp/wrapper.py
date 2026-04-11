@@ -7,16 +7,6 @@ from .model import SimVP
 SUPPORTED_ARCHS = ("simvp", "hybrid_unet_facts")
 
 
-def validate_hybrid_sequence_lengths(arch: str, in_T: int, out_T: int) -> None:
-    arch = arch.lower()
-    if arch == "hybrid_unet_facts" and in_T != out_T:
-        raise ValueError(
-            "HybridUNetFacTS only supports equal-length input/output because its translator "
-            "is an equal-length hidden-state transform and does not include an explicit "
-            f"temporal projection head. Received in_T={in_T}, out_T={out_T}."
-        )
-
-
 class SimVPForecast(nn.Module):
     def __init__(
         self,
@@ -40,7 +30,6 @@ class SimVPForecast(nn.Module):
         super().__init__()
         self.arch = arch.lower()
         self.out_T = out_T
-        validate_hybrid_sequence_lengths(self.arch, in_T, out_T)
 
         if self.arch == "simvp":
             self.backbone = SimVP(
