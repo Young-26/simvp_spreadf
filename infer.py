@@ -102,6 +102,12 @@ def main():
         device = torch.device("cpu")
     amp_enabled = args.amp and device.type == "cuda"
 
+    if arch == "hybrid_unet_facts" and out_T != in_T:
+        print(
+            "hybrid_unet_facts uses an equal-length backbone and will truncate decoded frames "
+            f"from {in_T} to {out_T} at the wrapper output."
+        )
+
     model = SimVPForecast(
         in_T=in_T,
         out_T=out_T,

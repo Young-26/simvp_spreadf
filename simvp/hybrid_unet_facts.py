@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -10,6 +11,36 @@ def _make_group_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
     while num_channels % groups != 0 and groups > 1:
         groups -= 1
     return nn.GroupNorm(groups, num_channels)
+
+
+def sinusoidal_embedding(length: int, dim: int) -> torch.Tensor:
+    if length <= 0 or dim <= 0:
+        raise ValueError(f"Sinusoidal embedding expects positive length and dim, got {length}, {dim}.")
+
+    position = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)
+    )
+
+    embedding = torch.zeros(length, dim, dtype=torch.float32)
+    embedding[:, 0::2] = torch.sin(position * div_term)
+    embedding[:, 1::2] = torch.cos(position * div_term[: embedding[:, 1::2].shape[1]])
+    return embedding.unsqueeze(0)
+
+
+def build_temporal_pos_embed(num_frames: int, dim: int) -> torch.Tensor:
+    return sinusoidal_embedding(num_frames, dim).unsqueeze(-1).unsqueeze(-1)
+
+
+def build_spatial_pos_embed(height: int, width: int, dim: int) -> torch.Tensor:
+    row_embed = sinusoidal_embedding(height, dim).permute(0, 2, 1).unsqueeze(-1)
+    col_embed = sinusoidal_embedding(width, dim).permute(0, 2, 1).unsqueeze(-2)
+
+    row_embed = row_embed.expand(-1, -1, -1, width)
+    col_embed = col_embed.expand(-1, -1, height, -1)
+
+    # Fixed separable 2D sinusoidal PE on the bottleneck grid.
+    return (0.5 * (row_embed + col_embed)).unsqueeze(1)
 
 
 class DropPath(nn.Module):
@@ -103,7 +134,6 @@ class DownsampleBlock(nn.Module):
 class UpsampleBlock(nn.Module):
     def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
         super().__init__()
-        self.skip_channels = skip_channels
         self.pre = ConvNormAct(in_channels, out_channels, kernel_size=3, stride=1)
         self.block = ResidualConvBlock(out_channels + skip_channels, out_channels)
 
@@ -118,25 +148,6 @@ class UpsampleBlock(nn.Module):
 
         x = self.block(x)
         return x
-
-
-class TemporalProjection(nn.Module):
-    def __init__(self, in_steps: int, out_steps: int):
-        super().__init__()
-        self.in_steps = in_steps
-        self.out_steps = out_steps
-        self.weight = nn.Parameter(torch.empty(out_steps, in_steps))
-        self.bias = nn.Parameter(torch.zeros(out_steps))
-        nn.init.xavier_uniform_(self.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) != self.in_steps:
-            raise ValueError(f"Expected {self.in_steps} input frames, but got {x.size(1)}.")
-
-        # x: [B, Tin, C, H, W] -> y: [B, Tout, C, H, W]
-        y = torch.einsum("btchw,ot->bochw", x, self.weight)
-        y = y + self.bias.view(1, self.out_steps, 1, 1, 1)
-        return y
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -189,7 +200,7 @@ class SwiGLUFeedForward(nn.Module):
         return x
 
 
-class FacTSBlock(nn.Module):
+class GatedTransformerBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -202,45 +213,96 @@ class FacTSBlock(nn.Module):
         super().__init__()
         hidden_dim = int(dim * ffn_ratio)
 
-        self.temporal_attn_norm = nn.LayerNorm(dim)
-        self.temporal_attn = MultiHeadSelfAttention(dim=dim, heads=heads, attn_dropout=attn_dropout)
-        self.temporal_attn_drop = DropPath(drop_path)
+        self.attn_norm = nn.LayerNorm(dim)
+        self.attn = MultiHeadSelfAttention(dim=dim, heads=heads, attn_dropout=attn_dropout)
+        self.attn_drop = DropPath(drop_path)
 
-        self.temporal_ffn_norm = nn.LayerNorm(dim)
-        self.temporal_ffn = SwiGLUFeedForward(dim=dim, hidden_dim=hidden_dim, dropout=ffn_dropout)
-        self.temporal_ffn_drop = DropPath(drop_path)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = SwiGLUFeedForward(dim=dim, hidden_dim=hidden_dim, dropout=ffn_dropout)
+        self.ffn_drop = DropPath(drop_path)
 
-        self.spatial_attn_norm = nn.LayerNorm(dim)
-        self.spatial_attn = MultiHeadSelfAttention(dim=dim, heads=heads, attn_dropout=attn_dropout)
-        self.spatial_attn_drop = DropPath(drop_path)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn_drop(self.attn(self.attn_norm(x)))
+        x = x + self.ffn_drop(self.ffn(self.ffn_norm(x)))
+        return x
 
-        self.spatial_ffn_norm = nn.LayerNorm(dim)
-        self.spatial_ffn = SwiGLUFeedForward(dim=dim, hidden_dim=hidden_dim, dropout=ffn_dropout)
-        self.spatial_ffn_drop = DropPath(drop_path)
+
+class GatedTransformerStack(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        heads: int = 8,
+        ffn_ratio: float = 4.0,
+        attn_dropout: float = 0.1,
+        ffn_dropout: float = 0.1,
+        drop_path: float = 0.1,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [
+                GatedTransformerBlock(
+                    dim=dim,
+                    heads=heads,
+                    ffn_ratio=ffn_ratio,
+                    attn_dropout=attn_dropout,
+                    ffn_dropout=ffn_dropout,
+                    drop_path=drop_path,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.norm(x)
+
+
+class StrictFacTSTranslator(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        depth: int = 2,
+        heads: int = 8,
+        ffn_ratio: float = 4.0,
+        attn_dropout: float = 0.1,
+        ffn_dropout: float = 0.1,
+        drop_path: float = 0.1,
+    ):
+        super().__init__()
+        self.temporal_transformer = GatedTransformerStack(
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            ffn_ratio=ffn_ratio,
+            attn_dropout=attn_dropout,
+            ffn_dropout=ffn_dropout,
+            drop_path=drop_path,
+        )
+        self.spatial_transformer = GatedTransformerStack(
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            ffn_ratio=ffn_ratio,
+            attn_dropout=attn_dropout,
+            ffn_dropout=ffn_dropout,
+            drop_path=drop_path,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, num_frames, channels, height, width = x.shape
 
-        # Temporal attention over each fixed spatial location:
+        # PredFormer-style Fac-T-S:
         # [B, T, C, H, W] -> [B * H * W, T, C]
         temporal_tokens = x.permute(0, 3, 4, 1, 2).reshape(batch_size * height * width, num_frames, channels)
-        temporal_tokens = temporal_tokens + self.temporal_attn_drop(
-            self.temporal_attn(self.temporal_attn_norm(temporal_tokens))
-        )
-        temporal_tokens = temporal_tokens + self.temporal_ffn_drop(
-            self.temporal_ffn(self.temporal_ffn_norm(temporal_tokens))
-        )
+        temporal_tokens = self.temporal_transformer(temporal_tokens)
         x = temporal_tokens.reshape(batch_size, height, width, num_frames, channels).permute(0, 3, 4, 1, 2)
 
-        # Spatial attention over each fixed time step:
-        # [B, T, C, H, W] -> [B * T, H * W, C]
+        # Then [B, T, C, H, W] -> [B * T, H * W, C]
         spatial_tokens = x.permute(0, 1, 3, 4, 2).reshape(batch_size * num_frames, height * width, channels)
-        spatial_tokens = spatial_tokens + self.spatial_attn_drop(
-            self.spatial_attn(self.spatial_attn_norm(spatial_tokens))
-        )
-        spatial_tokens = spatial_tokens + self.spatial_ffn_drop(
-            self.spatial_ffn(self.spatial_ffn_norm(spatial_tokens))
-        )
+        spatial_tokens = self.spatial_transformer(spatial_tokens)
         x = spatial_tokens.reshape(batch_size, num_frames, height, width, channels).permute(0, 1, 4, 2, 3)
         return x
 
@@ -292,7 +354,7 @@ class HybridUNetFacTS(nn.Module):
     def __init__(
         self,
         in_T: int = 8,
-        out_T: int = 2,
+        out_T: int = 8,
         in_channels: int = 3,
         height: int = 448,
         width: int = 448,
@@ -309,6 +371,11 @@ class HybridUNetFacTS(nn.Module):
             raise ValueError("HybridUNetFacTS expects image height and width to be divisible by 32.")
         if depth < 1:
             raise ValueError(f"depth must be >= 1, but got {depth}.")
+        if in_T != out_T:
+            raise ValueError(
+                "HybridUNetFacTS only supports equal-length input/output because its translator "
+                f"is a recurrent-free hidden-state transform. Received in_T={in_T}, out_T={out_T}."
+            )
 
         self.in_T = in_T
         self.out_T = out_T
@@ -320,42 +387,35 @@ class HybridUNetFacTS(nn.Module):
         self.bottleneck_width = width // 32
 
         self.encoder = FrameEncoder(in_channels=in_channels, stage_dims=self.stage_dims)
-        self.temporal_pos_embed = nn.Parameter(torch.zeros(1, in_T, self.stage_dims[-1], 1, 1))
-        self.spatial_row_embed = nn.Parameter(
-            torch.zeros(1, 1, self.stage_dims[-1], self.bottleneck_height, 1)
-        )
-        self.spatial_col_embed = nn.Parameter(
-            torch.zeros(1, 1, self.stage_dims[-1], 1, self.bottleneck_width)
-        )
-
-        self.blocks = nn.ModuleList(
-            [
-                FacTSBlock(
-                    dim=self.stage_dims[-1],
-                    heads=heads,
-                    ffn_ratio=ffn_ratio,
-                    attn_dropout=attn_dropout,
-                    ffn_dropout=ffn_dropout,
-                    drop_path=drop_path,
-                )
-                for _ in range(depth)
-            ]
-        )
-
-        self.bottleneck_projector = TemporalProjection(in_steps=in_T, out_steps=out_T)
-        self.skip_projectors = nn.ModuleList(
-            [TemporalProjection(in_steps=in_T, out_steps=out_T) for _ in range(len(self.stage_dims) - 1)]
+        self.translator = StrictFacTSTranslator(
+            dim=self.stage_dims[-1],
+            depth=depth,
+            heads=heads,
+            ffn_ratio=ffn_ratio,
+            attn_dropout=attn_dropout,
+            ffn_dropout=ffn_dropout,
+            drop_path=drop_path,
         )
         self.decoder = FrameDecoder(stage_dims=self.stage_dims, out_channels=in_channels)
 
-        self._init_parameters()
-
-    def _init_parameters(self) -> None:
-        nn.init.normal_(self.temporal_pos_embed, std=0.02)
-        nn.init.normal_(self.spatial_row_embed, std=0.02)
-        nn.init.normal_(self.spatial_col_embed, std=0.02)
+        self.register_buffer(
+            "temporal_pos_embed",
+            build_temporal_pos_embed(self.in_T, self.stage_dims[-1]),
+            persistent=False,
+        )
+        self.register_buffer(
+            "spatial_pos_embed",
+            build_spatial_pos_embed(self.bottleneck_height, self.bottleneck_width, self.stage_dims[-1]),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.in_T != self.out_T:
+            raise RuntimeError(
+                "HybridUNetFacTS forward requires in_T == out_T. "
+                f"Configured values are in_T={self.in_T}, out_T={self.out_T}."
+            )
+
         batch_size, num_frames, channels, height, width = x.shape
         if num_frames != self.in_T:
             raise ValueError(f"Expected {self.in_T} input frames, but got {num_frames}.")
@@ -381,29 +441,21 @@ class HybridUNetFacTS(nn.Module):
             for skip in skips
         ]
 
-        bottleneck = (
-            bottleneck
-            + self.temporal_pos_embed
-            + self.spatial_row_embed
-            + self.spatial_col_embed
-        )
-        for block in self.blocks:
-            bottleneck = block(bottleneck)
-
-        bottleneck = self.bottleneck_projector(bottleneck)
-        skips = [projector(skip) for projector, skip in zip(self.skip_projectors, skips)]
+        bottleneck = bottleneck + self.temporal_pos_embed.to(dtype=bottleneck.dtype)
+        bottleneck = bottleneck + self.spatial_pos_embed.to(dtype=bottleneck.dtype)
+        bottleneck = self.translator(bottleneck)
 
         bottleneck = bottleneck.reshape(
-            batch_size * self.out_T,
+            batch_size * num_frames,
             self.stage_dims[-1],
             self.bottleneck_height,
             self.bottleneck_width,
         )
         decoded_skips = [
-            skip.reshape(batch_size * self.out_T, skip.size(2), skip.size(3), skip.size(4))
+            skip.reshape(batch_size * num_frames, skip.size(2), skip.size(3), skip.size(4))
             for skip in skips
         ]
 
         y = self.decoder(bottleneck, decoded_skips)
-        y = y.reshape(batch_size, self.out_T, self.in_channels, height, width)
+        y = y.reshape(batch_size, num_frames, self.in_channels, height, width)
         return y

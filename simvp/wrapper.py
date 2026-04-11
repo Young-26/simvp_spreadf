@@ -30,6 +30,7 @@ class SimVPForecast(nn.Module):
         super().__init__()
         self.arch = arch.lower()
         self.out_T = out_T
+        self.backbone_out_T = out_T
 
         if self.arch == "simvp":
             self.backbone = SimVP(
@@ -40,9 +41,17 @@ class SimVPForecast(nn.Module):
                 N_T=N_T,
             )
         elif self.arch == "hybrid_unet_facts":
+            if out_T > in_T:
+                raise ValueError(
+                    "hybrid_unet_facts uses an equal-length HybridUNetFacTS backbone, so the "
+                    f"requested out_T={out_T} cannot exceed in_T={in_T}."
+                )
+            # The strict Fac-T-S backbone itself is equal-length. The wrapper can still
+            # truncate the decoded sequence to preserve the existing 8 -> 2 task interface.
+            self.backbone_out_T = in_T
             self.backbone = HybridUNetFacTS(
                 in_T=in_T,
-                out_T=out_T,
+                out_T=in_T,
                 in_channels=C,
                 height=H,
                 width=W,
@@ -62,6 +71,6 @@ class SimVPForecast(nn.Module):
         return: [B, out_T, C, H, W]
         """
         y = self.backbone(x)
-        if self.arch == "simvp":
+        if self.arch == "simvp" or self.out_T != self.backbone_out_T:
             y = y[:, :self.out_T]
         return y

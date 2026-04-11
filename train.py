@@ -346,6 +346,11 @@ def main():
     if is_main_process():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
+        if args.arch == "hybrid_unet_facts" and args.out_T != args.in_T:
+            logger.info(
+                "hybrid_unet_facts uses an equal-length backbone and will truncate decoded frames "
+                f"from {args.in_T} to {args.out_T} at the wrapper output."
+            )
 
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
