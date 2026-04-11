@@ -407,6 +407,3 @@ class HybridUNetFacTS(nn.Module):
         y = self.decoder(bottleneck, decoded_skips)
         y = y.reshape(batch_size, self.out_T, self.in_channels, height, width)
         return y
-
-
-HybridUNetTransformerFacTS = HybridUNetFacTS

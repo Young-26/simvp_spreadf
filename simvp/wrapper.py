@@ -58,11 +58,10 @@ class SimVPForecast(nn.Module):
 
     def forward(self, x):
         """
-        x: [B, 8, C, H, W]
-        return: [B, 2, C, H, W]
+        x: [B, in_T, C, H, W]
+        return: [B, out_T, C, H, W]
         """
         y = self.backbone(x)
         if self.arch == "simvp":
             y = y[:, :self.out_T]
         return y
-

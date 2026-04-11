@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--in_T", type=int, default=None)
+    parser.add_argument("--out_T", type=int, default=None)
     parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
     parser.add_argument("--max_batches", type=int, default=None)
     return parser.parse_args()
@@ -73,6 +75,14 @@ def resolve_override(cli_value, saved_args: dict, key: str, default):
     return saved_args.get(key, default)
 
 
+def resolve_saved_first(saved_args: dict, key: str, cli_value, default):
+    if key in saved_args:
+        return saved_args[key]
+    if cli_value is not None:
+        return cli_value
+    return default
+
+
 def main():
     args = parse_args()
     ckpt_path = Path(args.checkpoint)
@@ -81,6 +91,8 @@ def main():
 
     image_mode = resolve_override(args.image_mode, saved_args, "image_mode", "L")
     image_size = resolve_override(args.image_size, saved_args, "image_size", 448)
+    in_T = resolve_saved_first(saved_args, "in_T", args.in_T, 8)
+    out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
     arch = resolve_override(args.arch, saved_args, "arch", "simvp")
     channels = 1 if image_mode == "L" else 3
 
@@ -91,8 +103,8 @@ def main():
     amp_enabled = args.amp and device.type == "cuda"
 
     model = SimVPForecast(
-        in_T=saved_args.get("in_T", 8),
-        out_T=saved_args.get("out_T", 2),
+        in_T=in_T,
+        out_T=out_T,
         C=channels,
         H=image_size,
         W=image_size,

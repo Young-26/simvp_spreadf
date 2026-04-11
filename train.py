@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--hid_T", type=int, default=128)
     parser.add_argument("--N_S", type=int, default=4)
     parser.add_argument("--N_T", type=int, default=4)
+    parser.add_argument("--in_T", type=int, default=8)
+    parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
     parser.add_argument("--hybrid_depth", type=int, default=2)
     parser.add_argument("--hybrid_heads", type=int, default=8)
@@ -324,6 +326,7 @@ def main():
         logger.info("Starting training")
         logger.info(f"save_dir: {args.save_dir}")
         logger.info(f"arch: {args.arch}")
+        logger.info(f"in_T: {args.in_T}  out_T: {args.out_T}")
         logger.info(f"train_manifest: {args.train_manifest}")
         logger.info(f"val_manifest: {args.val_manifest}")
         logger.info(f"use_ddp: {use_ddp}")
@@ -338,9 +341,11 @@ def main():
         device = torch.device(f"cuda:{local_rank}" if use_ddp else args.device)
     else:
         device = torch.device("cpu")
+    amp_enabled = args.amp and device.type == "cuda"
 
     if is_main_process():
         logger.info(f"device: {device}")
+        logger.info(f"amp_enabled: {amp_enabled}")
 
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
@@ -399,8 +404,8 @@ def main():
     )
 
     model = SimVPForecast(
-        in_T=8,
-        out_T=2,
+        in_T=args.in_T,
+        out_T=args.out_T,
         C=channels,
         H=args.image_size,
         W=args.image_size,
@@ -431,7 +436,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     best_epoch = 0
     best_val_mae = float("inf")
@@ -463,7 +468,7 @@ def main():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast(device_type="cuda", enabled=args.amp):
+                with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
                     pred = model(x)
                     loss = mae_criterion(pred, y)
 
@@ -487,7 +492,7 @@ def main():
                 loader=val_loader,
                 mae_criterion=mae_criterion,
                 device=device,
-                amp_enabled=args.amp,
+                amp_enabled=amp_enabled,
             )
 
             val_mae = val_metrics["val_mae"]
