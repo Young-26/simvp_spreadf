@@ -15,11 +15,13 @@ class IonogramManifestDataset(Dataset):
         image_mode: str = "L",   # "L" or "RGB"
         image_size: int = 448,
         normalize_to_01: bool = True,
+        local_crop: tuple[int, int] | None = (186, 410),
     ):
         self.manifest_path = Path(manifest_path)
         self.image_mode = image_mode
         self.image_size = image_size
         self.normalize_to_01 = normalize_to_01
+        self.local_crop = local_crop
 
         self.samples: List[Dict] = []
         with open(self.manifest_path, "r", encoding="utf-8") as f:
@@ -78,7 +80,7 @@ class IonogramManifestDataset(Dataset):
         x = torch.stack([self._load_image(p) for p in item["input_paths"]], dim=0)   # [8, C, H, W]
         y = torch.stack([self._load_image(p) for p in item["target_paths"]], dim=0)  # [2, C, H, W]
 
-        return {
+        sample = {
             "x": x,
             "y": y,
             "label": item.get("label", None),
@@ -88,3 +90,15 @@ class IonogramManifestDataset(Dataset):
             "timestamps": item.get("timestamps", None),
             "split": item.get("split", None),
         }
+
+        if self.local_crop is not None:
+            sample["x_local"] = self.crop_f_region(x)
+            sample["y_local"] = self.crop_f_region(y)
+
+        return sample
+    
+    def crop_f_region(self, seq: torch.Tensor) -> torch.Tensor:
+        # Fixed F-region crop boundary in the 448x448 image coordinate system.
+        # local_crop=(186, 410) produces a 224x448 local sequence.
+        top, bottom = self.local_crop
+        return seq[:, :, top:bottom, :]
