@@ -534,6 +534,341 @@ class FrameDecoder(nn.Module):
         return x
 
 
+class TAUChannelMixing(nn.Module):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=False),
+            _make_group_norm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TemporalAttention(nn.Module):
+    """Minimal TAU-style temporal attention for the local bottleneck translator."""
+
+    def __init__(self, dim: int, kernel_size: int = 21, attn_shortcut: bool = True):
+        super().__init__()
+        self.proj_1 = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.activation = nn.GELU()
+        self.temporal_gating_unit = TemporalAttentionModule(dim, kernel_size)
+        self.proj_2 = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.attn_shortcut = attn_shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x if self.attn_shortcut else None
+        x = self.proj_1(x)
+        x = self.activation(x)
+        x = self.temporal_gating_unit(x)
+        x = self.proj_2(x)
+        if shortcut is not None:
+            x = x + shortcut
+        return x
+
+
+class TemporalAttentionModule(nn.Module):
+    def __init__(self, dim: int, kernel_size: int, dilation: int = 3, reduction: int = 16):
+        super().__init__()
+        d_k = 2 * dilation - 1
+        d_p = (d_k - 1) // 2
+        dd_k = kernel_size // dilation + ((kernel_size // dilation) % 2 - 1)
+        dd_p = dilation * (dd_k - 1) // 2
+
+        self.conv0 = nn.Conv2d(dim, dim, kernel_size=d_k, padding=d_p, groups=dim, bias=False)
+        self.conv_spatial = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=dd_k,
+            stride=1,
+            padding=dd_p,
+            groups=dim,
+            dilation=dilation,
+            bias=False,
+        )
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+
+        reduction_factor = max(dim // reduction, 4)
+        reduced_dim = max(dim // reduction_factor, 4)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(dim, reduced_dim, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_dim, dim, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        attn = self.conv0(x)
+        attn = self.conv_spatial(attn)
+        attn = self.conv1(attn)
+
+        batch_size, channels, _, _ = x.shape
+        se = self.avg_pool(x).view(batch_size, channels)
+        se = self.fc(se).view(batch_size, channels, 1, 1)
+        return se * attn * residual
+
+
+class TAUBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 21,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.1,
+        init_value: float = 1e-2,
+    ):
+        super().__init__()
+        self.norm1 = _make_group_norm(dim)
+        self.attn = TemporalAttention(dim, kernel_size=kernel_size)
+        self.drop_path = DropPath(drop_path)
+
+        self.norm2 = _make_group_norm(dim)
+        self.mlp = TAUChannelMixing(dim, mlp_ratio=mlp_ratio, dropout=dropout)
+
+        self.layer_scale_1 = nn.Parameter(init_value * torch.ones(dim), requires_grad=True)
+        self.layer_scale_2 = nn.Parameter(init_value * torch.ones(dim), requires_grad=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(
+            self.layer_scale_1.view(1, -1, 1, 1) * self.attn(self.norm1(x))
+        )
+        x = x + self.drop_path(
+            self.layer_scale_2.view(1, -1, 1, 1) * self.mlp(self.norm2(x))
+        )
+        return x
+
+
+class TAUTranslator(nn.Module):
+    def __init__(
+        self,
+        in_T: int,
+        bottleneck_dim: int,
+        depth: int = 2,
+        kernel_size: int = 21,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.1,
+    ):
+        super().__init__()
+        if depth < 1:
+            raise ValueError(f"TAUTranslator expects depth >= 1, but got {depth}.")
+
+        dim = in_T * bottleneck_dim
+        drop_rates = torch.linspace(0.0, drop_path, depth).tolist()
+        self.blocks = nn.ModuleList(
+            [
+                TAUBlock(
+                    dim=dim,
+                    kernel_size=kernel_size,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drop_rates[i],
+                )
+                for i in range(depth)
+            ]
+        )
+        self.in_T = in_T
+        self.bottleneck_dim = bottleneck_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, num_frames, channels, height, width = x.shape
+        if num_frames != self.in_T:
+            raise ValueError(f"Expected {self.in_T} local frames, but got {num_frames}.")
+        if channels != self.bottleneck_dim:
+            raise ValueError(f"Expected local bottleneck dim {self.bottleneck_dim}, but got {channels}.")
+
+        z = x.reshape(batch_size, num_frames * channels, height, width)
+        for block in self.blocks:
+            z = block(z)
+        return z.reshape(batch_size, num_frames, channels, height, width)
+
+
+class LocalFRegionBranch(nn.Module):
+    """
+    Lightweight local prior predictor for the fixed F-region crop.
+
+    It consumes local past frames and predicts fusion-ready future priors at the
+    decoder 1/8 and 1/4 scales instead of reconstructing full local images.
+    """
+
+    def __init__(
+        self,
+        in_T: int,
+        out_T: int,
+        in_channels: int,
+        full_height: int,
+        full_width: int,
+        local_crop: Tuple[int, int] = (186, 410),
+        branch_dims: Sequence[int] = (16, 32, 64),
+        prior_1_4_channels: int = 64,
+        prior_1_8_channels: int = 128,
+        tau_depth: int = 2,
+        tau_kernel_size: int = 21,
+        tau_mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        drop_path: float = 0.1,
+    ):
+        super().__init__()
+        if len(branch_dims) != 3:
+            raise ValueError(f"LocalFRegionBranch expects 3 branch dims, but got {len(branch_dims)}.")
+
+        top, bottom = local_crop
+        if bottom <= top:
+            raise ValueError(f"local_crop expects bottom > top, but got {local_crop}.")
+
+        self.in_T = in_T
+        self.out_T = out_T
+        self.in_channels = in_channels
+        self.full_height = full_height
+        self.full_width = full_width
+        self.local_crop = tuple(local_crop)
+        self.local_height = bottom - top
+        self.local_width = full_width
+        self.branch_dims = tuple(branch_dims)
+
+        self.stem = DownsampleBlock(in_channels, self.branch_dims[0])               # 224x448 -> 112x224
+        self.down1 = DownsampleBlock(self.branch_dims[0], self.branch_dims[1])      # 112x224 -> 56x112
+        self.down2 = DownsampleBlock(self.branch_dims[1], self.branch_dims[2])      # 56x112 -> 28x56
+        self.temporal_module = TAUTranslator(
+            in_T=in_T,
+            bottleneck_dim=self.branch_dims[2],
+            depth=tau_depth,
+            kernel_size=tau_kernel_size,
+            mlp_ratio=tau_mlp_ratio,
+            dropout=dropout,
+            drop_path=drop_path,
+        )
+
+        self.bottleneck_future_head = TemporalConvForecastHead(
+            in_T=in_T,
+            out_T=out_T,
+            dim=self.branch_dims[2],
+            kernel_size=3,
+            dropout=dropout,
+        )
+        self.skip_1_4_future_head = TemporalConvForecastHead(
+            in_T=in_T,
+            out_T=out_T,
+            dim=self.branch_dims[1],
+            kernel_size=3,
+            dropout=dropout,
+        )
+
+        self.up_1_8_to_1_4 = UpsampleBlock(self.branch_dims[2], self.branch_dims[1], self.branch_dims[1])
+        self.prior_1_8_head = nn.Sequential(
+            ResidualConvBlock(self.branch_dims[2], self.branch_dims[2]),
+            nn.Conv2d(self.branch_dims[2], prior_1_8_channels, kernel_size=1),
+        )
+        self.prior_1_4_head = nn.Sequential(
+            ResidualConvBlock(self.branch_dims[1], self.branch_dims[1]),
+            nn.Conv2d(self.branch_dims[1], prior_1_4_channels, kernel_size=1),
+        )
+
+    def _project_to_global_scale(self, prior_local: torch.Tensor, scale: int) -> torch.Tensor:
+        batch_size, num_frames, channels, _, _ = prior_local.shape
+        target_height = self.local_height // scale
+        target_width = self.full_width // scale
+        global_height = self.full_height // scale
+        global_width = self.full_width // scale
+
+        if prior_local.shape[-2:] != (target_height, target_width):
+            prior_local = F.interpolate(
+                prior_local.reshape(batch_size * num_frames, channels, prior_local.size(-2), prior_local.size(-1)),
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+            ).reshape(batch_size, num_frames, channels, target_height, target_width)
+
+        # local_crop=(186, 410) is defined in the 448x448 global coordinate system.
+        # After downsampling, the prior is placed back onto the matching global decoder grid.
+        start_row = int(self.local_crop[0] / float(scale) + 0.5)
+        start_row = min(max(start_row, 0), max(global_height - target_height, 0))
+
+        canvas = prior_local.new_zeros(batch_size, num_frames, channels, global_height, global_width)
+        canvas[:, :, :, start_row:start_row + target_height, :] = prior_local
+        return canvas
+
+    def forward(self, x_local: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, num_frames, channels, height, width = x_local.shape
+        if num_frames != self.in_T:
+            raise ValueError(f"Expected {self.in_T} local input frames, but got {num_frames}.")
+        if channels != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} local channels, but got {channels}.")
+        if height != self.local_height or width != self.local_width:
+            raise ValueError(
+                f"Expected local input size {(self.local_height, self.local_width)}, but got {(height, width)}."
+            )
+
+        frames = x_local.reshape(batch_size * num_frames, channels, height, width)
+        skip_1_2 = self.stem(frames)
+        skip_1_4 = self.down1(skip_1_2)
+        bottleneck = self.down2(skip_1_4)
+
+        skip_1_4 = skip_1_4.reshape(
+            batch_size,
+            num_frames,
+            self.branch_dims[1],
+            skip_1_4.size(-2),
+            skip_1_4.size(-1),
+        )
+        bottleneck = bottleneck.reshape(
+            batch_size,
+            num_frames,
+            self.branch_dims[2],
+            bottleneck.size(-2),
+            bottleneck.size(-1),
+        )
+
+        # TAU models the future local F-region dynamics on the compact 1/8 local grid.
+        bottleneck = self.temporal_module(bottleneck)
+        future_bottleneck = self.bottleneck_future_head(bottleneck)      # [B, out_T, C, 28, 56]
+        future_skip_1_4 = self.skip_1_4_future_head(skip_1_4)            # [B, out_T, C, 56, 112]
+
+        prior_1_8_local = self.prior_1_8_head(
+            future_bottleneck.reshape(
+                batch_size * self.out_T,
+                self.branch_dims[2],
+                future_bottleneck.size(-2),
+                future_bottleneck.size(-1),
+            )
+        ).reshape(batch_size, self.out_T, -1, future_bottleneck.size(-2), future_bottleneck.size(-1))
+
+        prior_1_4_local = self.up_1_8_to_1_4(
+            future_bottleneck.reshape(
+                batch_size * self.out_T,
+                self.branch_dims[2],
+                future_bottleneck.size(-2),
+                future_bottleneck.size(-1),
+            ),
+            future_skip_1_4.reshape(
+                batch_size * self.out_T,
+                self.branch_dims[1],
+                future_skip_1_4.size(-2),
+                future_skip_1_4.size(-1),
+            ),
+        )
+        prior_1_4_local = self.prior_1_4_head(prior_1_4_local).reshape(
+            batch_size,
+            self.out_T,
+            -1,
+            future_skip_1_4.size(-2),
+            future_skip_1_4.size(-1),
+        )
+
+        return {
+            "prior_1_8": self._project_to_global_scale(prior_1_8_local, scale=8),
+            "prior_1_4": self._project_to_global_scale(prior_1_4_local, scale=4),
+        }
+
+
 class HybridUNetFacTS(nn.Module):
     def __init__(
         self,
@@ -549,6 +884,10 @@ class HybridUNetFacTS(nn.Module):
         attn_dropout: float = 0.1,
         ffn_dropout: float = 0.1,
         drop_path: float = 0.1,
+        use_local_branch: bool = False,
+        local_crop: Tuple[int, int] = (186, 410),
+        local_branch_dims: Sequence[int] = (16, 32, 64),
+        local_branch_depth: int = 2,
     ):
         super().__init__()
         if height % 32 != 0 or width % 32 != 0:
@@ -566,6 +905,8 @@ class HybridUNetFacTS(nn.Module):
         self.stage_dims = tuple(stage_dims)
         self.bottleneck_height = height // 32
         self.bottleneck_width = width // 32
+        self.use_local_branch = bool(use_local_branch)
+        self.local_crop = tuple(local_crop)
 
         self.encoder = FrameEncoder(in_channels=in_channels, stage_dims=self.stage_dims)
         self.translator = StrictFacTSTranslator(
@@ -601,6 +942,26 @@ class HybridUNetFacTS(nn.Module):
         )
         self.decoder = FrameDecoder(stage_dims=self.stage_dims, out_channels=in_channels)
 
+        if self.use_local_branch:
+            self.local_branch = LocalFRegionBranch(
+                in_T=in_T,
+                out_T=out_T,
+                in_channels=in_channels,
+                full_height=height,
+                full_width=width,
+                local_crop=self.local_crop,
+                branch_dims=local_branch_dims,
+                prior_1_4_channels=self.stage_dims[1],
+                prior_1_8_channels=self.stage_dims[2],
+                tau_depth=local_branch_depth,
+                dropout=ffn_dropout,
+                drop_path=drop_path,
+            )
+            self.local_prior_scale_1_4 = nn.Parameter(torch.tensor(1.0))
+            self.local_prior_scale_1_8 = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.local_branch = None
+
         self.register_buffer(
             "temporal_pos_embed",
             build_temporal_pos_embed(self.in_T, self.stage_dims[-1]),
@@ -612,7 +973,12 @@ class HybridUNetFacTS(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_local: Optional[torch.Tensor] = None,
+        return_aux: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch_size, num_frames, channels, height, width = x.shape
         if num_frames != self.in_T:
             raise ValueError(f"Expected {self.in_T} input frames, but got {num_frames}.")
@@ -649,6 +1015,15 @@ class HybridUNetFacTS(nn.Module):
             for head, skip in zip(self.skip_future_heads, skips)
         ]
 
+        aux_outputs: dict[str, torch.Tensor] = {}
+        if self.local_branch is not None and x_local is not None:
+            local_priors = self.local_branch(x_local)
+            # The local branch predicts future F-region priors and injects them into
+            # the global decoder's 1/8 and 1/4 skip features.
+            future_skips[2] = future_skips[2] + self.local_prior_scale_1_8 * local_priors["prior_1_8"]
+            future_skips[1] = future_skips[1] + self.local_prior_scale_1_4 * local_priors["prior_1_4"]
+            aux_outputs.update(local_priors)
+
         future_bottleneck = future_bottleneck.reshape(
             batch_size * self.out_T,
             self.stage_dims[-1],
@@ -662,4 +1037,6 @@ class HybridUNetFacTS(nn.Module):
 
         y = self.decoder(future_bottleneck, decoded_skips)
         y = y.reshape(batch_size, self.out_T, self.in_channels, height, width)
+        if return_aux:
+            return y, aux_outputs
         return y

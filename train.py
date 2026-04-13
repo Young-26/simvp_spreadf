@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--hybrid_attn_dropout", type=float, default=0.1)
     parser.add_argument("--hybrid_ffn_dropout", type=float, default=0.1)
     parser.add_argument("--hybrid_drop_path", type=float, default=0.1)
+    parser.add_argument("--use_local_branch", action="store_true")
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
@@ -76,7 +77,10 @@ def validate_dataset_sequence_lengths(dataset, split_name: str, in_T: int, out_T
 def collate_fn(batch):
     x = torch.stack([item["x"] for item in batch], dim=0)
     y = torch.stack([item["y"] for item in batch], dim=0)
-    return x, y
+    x_local = None
+    if "x_local" in batch[0]:
+        x_local = torch.stack([item["x_local"] for item in batch], dim=0)
+    return x, y, x_local
 
 
 def is_dist_avail_and_initialized():
@@ -250,12 +254,14 @@ def evaluate(model, loader, mae_criterion, device, amp_enabled=False):
 
     iterator = tqdm(loader, desc="val", leave=False) if is_main_process() else loader
 
-    for x, y in iterator:
+    for x, y, x_local in iterator:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        if x_local is not None:
+            x_local = x_local.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-            pred = model(x)
+            pred = model(x, x_local=x_local)
             mae = mae_criterion(pred, y)
 
         mse = tensor_mse(pred, y).item()
@@ -366,16 +372,20 @@ def main():
                 "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
                 "and lightweight temporal-conv skip forecasters."
             )
+            logger.info(f"use_local_branch: {args.use_local_branch}")
 
+    local_crop = (186, 410) if args.use_local_branch else None
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
         image_mode=args.image_mode,
         image_size=args.image_size,
+        local_crop=local_crop,
     )
     val_set = IonogramManifestDataset(
         manifest_path=args.val_manifest,
         image_mode=args.image_mode,
         image_size=args.image_size,
+        local_crop=local_crop,
     )
 
     if is_main_process():
@@ -443,6 +453,7 @@ def main():
         hybrid_attn_dropout=args.hybrid_attn_dropout,
         hybrid_ffn_dropout=args.hybrid_ffn_dropout,
         hybrid_drop_path=args.hybrid_drop_path,
+        use_local_branch=args.use_local_branch,
     ).to(device)
 
     if use_ddp:
@@ -485,14 +496,16 @@ def main():
 
             iterator = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}") if is_main_process() else train_loader
 
-            for x, y in iterator:
+            for x, y, x_local in iterator:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
+                if x_local is not None:
+                    x_local = x_local.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                    pred = model(x)
+                    pred = model(x, x_local=x_local)
                     loss = mae_criterion(pred, y)
 
                 scaler.scale(loss).backward()

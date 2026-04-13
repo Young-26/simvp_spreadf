@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--in_T", type=int, default=None)
     parser.add_argument("--out_T", type=int, default=None)
     parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
+    parser.add_argument("--use_local_branch", action="store_true", default=None)
     parser.add_argument("--max_batches", type=int, default=None)
     return parser.parse_args()
 
@@ -31,7 +32,10 @@ def parse_args():
 def collate_fn(batch):
     x = torch.stack([item["x"] for item in batch], dim=0)
     y = torch.stack([item["y"] for item in batch], dim=0)
-    return x, y
+    x_local = None
+    if "x_local" in batch[0]:
+        x_local = torch.stack([item["x_local"] for item in batch], dim=0)
+    return x, y, x_local
 
 
 def tensor_mse(pred, target):
@@ -110,6 +114,7 @@ def main():
     in_T = resolve_saved_first(saved_args, "in_T", args.in_T, 8)
     out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
     arch = resolve_override(args.arch, saved_args, "arch", "simvp")
+    use_local_branch = resolve_override(args.use_local_branch, saved_args, "use_local_branch", False)
     channels = 1 if image_mode == "L" else 3
 
     if torch.cuda.is_available() and args.device.startswith("cuda"):
@@ -135,15 +140,18 @@ def main():
         hybrid_attn_dropout=saved_args.get("hybrid_attn_dropout", 0.1),
         hybrid_ffn_dropout=saved_args.get("hybrid_ffn_dropout", 0.1),
         hybrid_drop_path=saved_args.get("hybrid_drop_path", 0.1),
+        use_local_branch=use_local_branch,
     )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     model.eval()
 
+    local_crop = (186, 410) if use_local_branch else None
     dataset = IonogramManifestDataset(
         manifest_path=args.manifest,
         image_mode=image_mode,
         image_size=image_size,
+        local_crop=local_crop,
     )
     validate_dataset_sequence_lengths(dataset, in_T, out_T)
     loader = DataLoader(
@@ -164,15 +172,17 @@ def main():
     total_count = 0
 
     with torch.inference_mode():
-        for batch_idx, (x, y) in enumerate(tqdm(loader, desc="infer"), start=1):
+        for batch_idx, (x, y, x_local) in enumerate(tqdm(loader, desc="infer"), start=1):
             if args.max_batches is not None and batch_idx > args.max_batches:
                 break
 
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            if x_local is not None:
+                x_local = x_local.to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                pred = model(x)
+                pred = model(x, x_local=x_local)
 
             mae = F.l1_loss(pred, y)
             mse = tensor_mse(pred, y)
@@ -183,6 +193,8 @@ def main():
                 print(f"arch: {arch}")
                 print(f"input shape:  {tuple(x.shape)}")
                 print(f"target shape: {tuple(y.shape)}")
+                if x_local is not None:
+                    print(f"x_local shape: {tuple(x_local.shape)}")
                 print(f"pred shape:   {tuple(pred.shape)}")
 
             batch_size = x.size(0)
