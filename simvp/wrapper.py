@@ -63,13 +63,13 @@ class SimVPForecast(nn.Module):
         else:
             raise ValueError(f"Unsupported arch '{arch}'. Available choices: {SUPPORTED_ARCHS}.")
 
-    def forward(self, x, x_local=None, return_aux: bool = False):
+    def forward(self, x, x_local=None, return_aux: bool = False, strict_local: bool = False):
         """
         x: [B, in_T, C, H, W]
         return: [B, out_T, C, H, W]
         """
         if self.arch == "hybrid_unet_facts":
-            y = self.backbone(x, x_local=x_local, return_aux=return_aux)
+            y = self.backbone(x, x_local=x_local, return_aux=return_aux, strict_local=strict_local)
         else:
             y = self.backbone(x)
         if self.arch == "simvp":

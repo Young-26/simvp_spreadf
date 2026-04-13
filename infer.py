@@ -27,6 +27,8 @@ def parse_args():
     parser.add_argument("--use_local_branch", action="store_true", default=None)
     parser.add_argument("--local_top", type=int, default=None)
     parser.add_argument("--local_bottom", type=int, default=None)
+    parser.add_argument("--report_local_metrics", action="store_true")
+    parser.add_argument("--strict_local_infer", action="store_true")
     parser.add_argument("--max_batches", type=int, default=None)
     return parser.parse_args()
 
@@ -199,7 +201,7 @@ def main():
                 y_local = y_local.to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                pred = model(x, x_local=x_local)
+                pred = model(x, x_local=x_local, strict_local=args.strict_local_infer)
 
             mae = F.l1_loss(pred, y)
             mse = tensor_mse(pred, y)
@@ -243,8 +245,9 @@ def main():
     print(f"global_mse:  {total_mse / total_count:.6f}")
     print(f"global_psnr: {total_psnr / total_count:.6f}")
     print(f"global_ssim: {total_ssim / total_count:.6f}")
-    print(f"local_mae:   {total_local_mae / max(total_local_count, 1):.6f}")
-    print(f"local_mse:   {total_local_mse / max(total_local_count, 1):.6f}")
+    if args.report_local_metrics:
+        print(f"local_mae:   {total_local_mae / max(total_local_count, 1):.6f}")
+        print(f"local_mse:   {total_local_mse / max(total_local_count, 1):.6f}")
 
 
 if __name__ == "__main__":

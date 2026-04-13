@@ -55,6 +55,13 @@ def parse_args():
     parser.add_argument("--local_top", type=int, default=186)
     parser.add_argument("--local_bottom", type=int, default=410)
     parser.add_argument("--report_local_metrics", action="store_true")
+    parser.add_argument(
+        "--best_metric_mode",
+        type=str,
+        default="combined",
+        choices=["global", "local", "combined"],
+    )
+    parser.add_argument("--best_metric_local_weight", type=float, default=1.0)
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
@@ -93,6 +100,19 @@ def collate_fn(batch):
 
 def crop_local_region(seq, top: int, bottom: int):
     return seq[:, :, :, top:bottom, :]
+
+
+def compute_best_score(
+    val_mae: float,
+    val_local_mae: float,
+    mode: str,
+    local_weight: float,
+) -> float:
+    if mode == "global":
+        return float(val_mae)
+    if mode == "local":
+        return float(val_local_mae)
+    return float(val_mae + local_weight * val_local_mae)
 
 
 def is_dist_avail_and_initialized():
@@ -191,6 +211,8 @@ def init_csv(csv_path: str):
                 "val_ssim",
                 "val_local_mae",
                 "val_local_mse",
+                "best_score",
+                "best_metric_mode",
                 "lr",
                 "epoch_time",
                 "gpu_mem_mb",
@@ -214,6 +236,8 @@ def append_csv(csv_path: str, row: dict):
             f'{row["val_ssim"]:.8f}',
             f'{row["val_local_mae"]:.8f}',
             f'{row["val_local_mse"]:.8f}',
+            f'{row["best_score"]:.8f}',
+            row["best_metric_mode"],
             f'{row["lr"]:.10f}',
             f'{row["epoch_time"]:.4f}',
             f'{row["gpu_mem_mb"]:.2f}',
@@ -273,6 +297,7 @@ def evaluate(
     amp_enabled=False,
     local_top: int = 186,
     local_bottom: int = 410,
+    strict_local: bool = False,
 ):
     model.eval()
 
@@ -296,7 +321,7 @@ def evaluate(
             y_local = y_local.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-            pred = model(x, x_local=x_local)
+            pred = model(x, x_local=x_local, strict_local=strict_local)
             mae = mae_criterion(pred, y)
             if y_local is not None:
                 pred_local = crop_local_region(pred, local_top, local_bottom)
@@ -340,7 +365,20 @@ def evaluate(
     return metrics
 
 
-def save_checkpoint(path, epoch, model, optimizer, scaler, args, best_epoch, best_val_mae, history, status):
+def save_checkpoint(
+    path,
+    epoch,
+    model,
+    optimizer,
+    scaler,
+    args,
+    best_epoch,
+    best_val_mae,
+    history,
+    status,
+    best_score: float | None = None,
+    best_metric_mode: str | None = None,
+):
     raw_model = unwrap_model(model)
     ckpt = {
         "epoch": epoch,
@@ -353,10 +391,25 @@ def save_checkpoint(path, epoch, model, optimizer, scaler, args, best_epoch, bes
         "history": history,
         "status": status,
     }
+    if best_score is not None:
+        ckpt["best_score"] = best_score
+    if best_metric_mode is not None:
+        ckpt["best_metric_mode"] = best_metric_mode
     torch.save(ckpt, path)
 
 
-def write_report(report_path, status, reason, total_epochs, completed_epochs, best_epoch, best_val_mae, history):
+def write_report(
+    report_path,
+    status,
+    reason,
+    total_epochs,
+    completed_epochs,
+    best_epoch,
+    best_val_mae,
+    history,
+    best_score: float | None = None,
+    best_metric_mode: str | None = None,
+):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("SimVP Training Report\n")
         f.write("=" * 60 + "\n")
@@ -365,6 +418,10 @@ def write_report(report_path, status, reason, total_epochs, completed_epochs, be
         f.write(f"total_epochs: {total_epochs}\n")
         f.write(f"completed_epochs: {completed_epochs}\n")
         f.write(f"best_epoch: {best_epoch}\n")
+        if best_metric_mode is not None:
+            f.write(f"best_metric_mode: {best_metric_mode}\n")
+        if best_score is not None:
+            f.write(f"best_score: {best_score:.8f}\n")
         f.write(f"best_val_mae: {best_val_mae:.8f}\n")
 
         if len(history) > 0:
@@ -422,6 +479,10 @@ def main():
             f"local_crop: ({args.local_top}, {args.local_bottom})"
         )
         logger.info(f"report_local_metrics: {args.report_local_metrics}")
+        logger.info(
+            f"best_metric_mode: {args.best_metric_mode}  "
+            f"best_metric_local_weight: {args.best_metric_local_weight}"
+        )
         if args.arch == "hybrid_unet_facts":
             logger.info(
                 "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
@@ -429,8 +490,9 @@ def main():
             )
             logger.info(f"use_local_branch: {args.use_local_branch}")
 
-    needs_local_data = args.use_local_branch or args.lambda_local > 0.0 or args.report_local_metrics
-    local_crop = (args.local_top, args.local_bottom) if needs_local_data else None
+    # Local targets are always kept available because local metrics and best-model
+    # selection can depend on them even when local logging is disabled.
+    local_crop = (args.local_top, args.local_bottom)
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
         image_mode=args.image_mode,
@@ -531,6 +593,7 @@ def main():
 
     best_epoch = 0
     best_val_mae = float("inf")
+    best_score = float("inf")
     history = []
 
     status = "RUNNING"
@@ -567,7 +630,7 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-                    pred = model(x, x_local=x_local)
+                    pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
                     loss_global = mae_criterion(pred, y)
                     if y_local is not None:
                         pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
@@ -613,6 +676,7 @@ def main():
                 amp_enabled=amp_enabled,
                 local_top=args.local_top,
                 local_bottom=args.local_bottom,
+                strict_local=args.use_local_branch,
             )
 
             val_mae = val_metrics["val_mae"]
@@ -621,6 +685,12 @@ def main():
             val_ssim = val_metrics["val_ssim"]
             val_local_mae = val_metrics["val_local_mae"]
             val_local_mse = val_metrics["val_local_mse"]
+            epoch_best_score = compute_best_score(
+                val_mae=val_mae,
+                val_local_mae=val_local_mae,
+                mode=args.best_metric_mode,
+                local_weight=args.best_metric_local_weight,
+            )
 
             lr = optimizer.param_groups[0]["lr"]
             epoch_time = time.time() - epoch_start_time
@@ -633,12 +703,25 @@ def main():
             gpu_mem_mb = reduce_sum_scalar(gpu_mem_mb_local, device) / get_world_size()
 
             if is_main_process():
-                if val_mae < best_val_mae:
+                previous_best_score = best_score
+                if epoch_best_score < best_score:
+                    best_score = epoch_best_score
                     best_val_mae = val_mae
                     best_epoch = epoch
                     is_best = True
+                    if math.isfinite(previous_best_score):
+                        refresh_reason = (
+                            f"best_score improved under mode={args.best_metric_mode}: "
+                            f"{epoch_best_score:.6f} < {previous_best_score:.6f}"
+                        )
+                    else:
+                        refresh_reason = (
+                            f"best_score initialized under mode={args.best_metric_mode}: "
+                            f"{epoch_best_score:.6f}"
+                        )
                 else:
                     is_best = False
+                    refresh_reason = ""
 
                 row = {
                     "epoch": epoch,
@@ -652,6 +735,8 @@ def main():
                     "val_ssim": val_ssim,
                     "val_local_mae": val_local_mae,
                     "val_local_mse": val_local_mse,
+                    "best_score": epoch_best_score,
+                    "best_metric_mode": args.best_metric_mode,
                     "lr": lr,
                     "epoch_time": epoch_time,
                     "gpu_mem_mb": gpu_mem_mb,
@@ -672,6 +757,8 @@ def main():
                     best_val_mae=best_val_mae,
                     history=history,
                     status="RUNNING",
+                    best_score=best_score,
+                    best_metric_mode=args.best_metric_mode,
                 )
 
                 logger.info(f"[Epoch {epoch}/{args.epochs}]")
@@ -685,7 +772,10 @@ def main():
                 logger.info(
                     f"train_mae(global_l1): {train_mae:.4f}  val_mae: {val_mae:.4f}"
                 )
-                if args.report_local_metrics or local_crop is not None:
+                logger.info(
+                    f"best_metric_mode: {args.best_metric_mode}  epoch_best_score: {epoch_best_score:.4f}"
+                )
+                if args.report_local_metrics:
                     logger.info(
                         f"val_local_mae: {val_local_mae:.4f}  val_local_mse: {val_local_mse:.4f}"
                     )
@@ -693,7 +783,7 @@ def main():
                     f"lr: {lr:.6f}  epoch_time: {epoch_time:.1f}s  gpu_mem: {gpu_mem_mb:.0f}MB"
                 )
                 logger.info(
-                    f"best_epoch: {best_epoch}  best_val_mae: {best_val_mae:.4f}"
+                    f"best_epoch: {best_epoch}  best_val_mae: {best_val_mae:.4f}  best_score: {best_score:.4f}"
                 )
 
                 if is_best:
@@ -709,8 +799,10 @@ def main():
                         best_val_mae=best_val_mae,
                         history=history,
                         status="BEST",
+                        best_score=best_score,
+                        best_metric_mode=args.best_metric_mode,
                     )
-                    logger.info(f"Found better model by val_mae. Saving to {best_path}")
+                    logger.info(f"{refresh_reason}. Saving best checkpoint to {best_path}")
 
             completed_epochs = epoch
 
@@ -749,6 +841,8 @@ def main():
                         best_val_mae=best_val_mae,
                         history=history,
                         status=status,
+                        best_score=best_score,
+                        best_metric_mode=args.best_metric_mode,
                     )
                     logger.info(f"Last checkpoint saved to {last_path}")
             except Exception as save_e:
@@ -764,6 +858,8 @@ def main():
                     best_epoch=best_epoch,
                     best_val_mae=best_val_mae if math.isfinite(best_val_mae) else -1.0,
                     history=history,
+                    best_score=best_score if math.isfinite(best_score) else -1.0,
+                    best_metric_mode=args.best_metric_mode,
                 )
                 logger.info(f"Training report written to {report_path}")
             except Exception as report_e:
@@ -775,6 +871,10 @@ def main():
             logger.info(f"Best epoch: {best_epoch}")
             if math.isfinite(best_val_mae):
                 logger.info(f"Best val_mae: {best_val_mae:.6f}")
+            if math.isfinite(best_score):
+                logger.info(
+                    f"Best score ({args.best_metric_mode}): {best_score:.6f}"
+                )
 
         cleanup_distributed()
 

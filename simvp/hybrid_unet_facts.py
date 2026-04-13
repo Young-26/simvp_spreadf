@@ -914,6 +914,7 @@ class HybridUNetFacTS(nn.Module):
         x: torch.Tensor,
         x_local: Optional[torch.Tensor] = None,
         return_aux: bool = False,
+        strict_local: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch_size, num_frames, channels, height, width = x.shape
         if num_frames != self.in_T:
@@ -967,6 +968,8 @@ class HybridUNetFacTS(nn.Module):
 
         aux_outputs: dict[str, torch.Tensor] = {}
         final_pred = global_pred
+        if self.local_refiner is not None and strict_local and x_local is None:
+            raise ValueError("use_local_branch=True but x_local is None under strict_local mode.")
         if self.local_refiner is not None and x_local is not None:
             # Refine only the fixed F-region in image space and write it back to the global prediction.
             coarse_local = self._crop_local_region(global_pred)
