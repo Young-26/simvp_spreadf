@@ -25,6 +25,8 @@ def parse_args():
     parser.add_argument("--out_T", type=int, default=None)
     parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
     parser.add_argument("--use_local_branch", action="store_true", default=None)
+    parser.add_argument("--local_top", type=int, default=None)
+    parser.add_argument("--local_bottom", type=int, default=None)
     parser.add_argument("--max_batches", type=int, default=None)
     return parser.parse_args()
 
@@ -33,9 +35,16 @@ def collate_fn(batch):
     x = torch.stack([item["x"] for item in batch], dim=0)
     y = torch.stack([item["y"] for item in batch], dim=0)
     x_local = None
+    y_local = None
     if "x_local" in batch[0]:
         x_local = torch.stack([item["x_local"] for item in batch], dim=0)
-    return x, y, x_local
+    if "y_local" in batch[0]:
+        y_local = torch.stack([item["y_local"] for item in batch], dim=0)
+    return x, y, x_local, y_local
+
+
+def crop_local_region(seq, top: int, bottom: int):
+    return seq[:, :, :, top:bottom, :]
 
 
 def tensor_mse(pred, target):
@@ -115,6 +124,8 @@ def main():
     out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
     arch = resolve_override(args.arch, saved_args, "arch", "simvp")
     use_local_branch = resolve_override(args.use_local_branch, saved_args, "use_local_branch", False)
+    local_top = resolve_saved_first(saved_args, "local_top", args.local_top, 186)
+    local_bottom = resolve_saved_first(saved_args, "local_bottom", args.local_bottom, 410)
     channels = 1 if image_mode == "L" else 3
 
     if torch.cuda.is_available() and args.device.startswith("cuda"):
@@ -141,12 +152,13 @@ def main():
         hybrid_ffn_dropout=saved_args.get("hybrid_ffn_dropout", 0.1),
         hybrid_drop_path=saved_args.get("hybrid_drop_path", 0.1),
         use_local_branch=use_local_branch,
+        local_crop=(local_top, local_bottom),
     )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     model.eval()
 
-    local_crop = (186, 410) if use_local_branch else None
+    local_crop = (local_top, local_bottom)
     dataset = IonogramManifestDataset(
         manifest_path=args.manifest,
         image_mode=image_mode,
@@ -169,10 +181,13 @@ def main():
     total_mse = 0.0
     total_psnr = 0.0
     total_ssim = 0.0
+    total_local_mae = 0.0
+    total_local_mse = 0.0
     total_count = 0
+    total_local_count = 0
 
     with torch.inference_mode():
-        for batch_idx, (x, y, x_local) in enumerate(tqdm(loader, desc="infer"), start=1):
+        for batch_idx, (x, y, x_local, y_local) in enumerate(tqdm(loader, desc="infer"), start=1):
             if args.max_batches is not None and batch_idx > args.max_batches:
                 break
 
@@ -180,6 +195,8 @@ def main():
             y = y.to(device, non_blocking=True)
             if x_local is not None:
                 x_local = x_local.to(device, non_blocking=True)
+            if y_local is not None:
+                y_local = y_local.to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
                 pred = model(x, x_local=x_local)
@@ -188,6 +205,13 @@ def main():
             mse = tensor_mse(pred, y)
             psnr = tensor_psnr(pred, y)
             ssim_sum = batch_ssim_sum(pred, y)
+            if y_local is not None:
+                pred_local = crop_local_region(pred, local_top, local_bottom)
+                local_mae = F.l1_loss(pred_local, y_local)
+                local_mse = tensor_mse(pred_local, y_local)
+            else:
+                local_mae = pred.new_zeros(())
+                local_mse = pred.new_zeros(())
 
             if batch_idx == 1:
                 print(f"arch: {arch}")
@@ -195,6 +219,8 @@ def main():
                 print(f"target shape: {tuple(y.shape)}")
                 if x_local is not None:
                     print(f"x_local shape: {tuple(x_local.shape)}")
+                if y_local is not None:
+                    print(f"y_local shape: {tuple(y_local.shape)}")
                 print(f"pred shape:   {tuple(pred.shape)}")
 
             batch_size = x.size(0)
@@ -203,16 +229,22 @@ def main():
             total_psnr += psnr.item() * batch_size
             total_ssim += ssim_sum
             total_count += batch_size
+            if y_local is not None:
+                total_local_mae += local_mae.item() * batch_size
+                total_local_mse += local_mse.item() * batch_size
+                total_local_count += batch_size
 
     if total_count == 0:
         raise RuntimeError("No samples were processed. Check --max_batches or the manifest file.")
 
     print(f"checkpoint: {ckpt_path}")
     print(f"samples: {total_count}")
-    print(f"mae:  {total_mae / total_count:.6f}")
-    print(f"mse:  {total_mse / total_count:.6f}")
-    print(f"psnr: {total_psnr / total_count:.6f}")
-    print(f"ssim: {total_ssim / total_count:.6f}")
+    print(f"global_mae:  {total_mae / total_count:.6f}")
+    print(f"global_mse:  {total_mse / total_count:.6f}")
+    print(f"global_psnr: {total_psnr / total_count:.6f}")
+    print(f"global_ssim: {total_ssim / total_count:.6f}")
+    print(f"local_mae:   {total_local_mae / max(total_local_count, 1):.6f}")
+    print(f"local_mse:   {total_local_mse / max(total_local_count, 1):.6f}")
 
 
 if __name__ == "__main__":

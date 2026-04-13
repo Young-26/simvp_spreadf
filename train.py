@@ -50,6 +50,11 @@ def parse_args():
     parser.add_argument("--hybrid_ffn_dropout", type=float, default=0.1)
     parser.add_argument("--hybrid_drop_path", type=float, default=0.1)
     parser.add_argument("--use_local_branch", action="store_true")
+    parser.add_argument("--lambda_global", type=float, default=1.0)
+    parser.add_argument("--lambda_local", type=float, default=0.5)
+    parser.add_argument("--local_top", type=int, default=186)
+    parser.add_argument("--local_bottom", type=int, default=410)
+    parser.add_argument("--report_local_metrics", action="store_true")
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
@@ -78,9 +83,16 @@ def collate_fn(batch):
     x = torch.stack([item["x"] for item in batch], dim=0)
     y = torch.stack([item["y"] for item in batch], dim=0)
     x_local = None
+    y_local = None
     if "x_local" in batch[0]:
         x_local = torch.stack([item["x_local"] for item in batch], dim=0)
-    return x, y, x_local
+    if "y_local" in batch[0]:
+        y_local = torch.stack([item["y_local"] for item in batch], dim=0)
+    return x, y, x_local, y_local
+
+
+def crop_local_region(seq, top: int, bottom: int):
+    return seq[:, :, :, top:bottom, :]
 
 
 def is_dist_avail_and_initialized():
@@ -169,11 +181,16 @@ def init_csv(csv_path: str):
             writer = csv.writer(f)
             writer.writerow([
                 "epoch",
+                "train_loss",
+                "train_loss_global",
+                "train_loss_local",
                 "train_mae",
                 "val_mae",
                 "val_mse",
                 "val_psnr",
                 "val_ssim",
+                "val_local_mae",
+                "val_local_mse",
                 "lr",
                 "epoch_time",
                 "gpu_mem_mb",
@@ -187,11 +204,16 @@ def append_csv(csv_path: str, row: dict):
         writer = csv.writer(f)
         writer.writerow([
             row["epoch"],
+            f'{row["train_loss"]:.8f}',
+            f'{row["train_loss_global"]:.8f}',
+            f'{row["train_loss_local"]:.8f}',
             f'{row["train_mae"]:.8f}',
             f'{row["val_mae"]:.8f}',
             f'{row["val_mse"]:.8f}',
             f'{row["val_psnr"]:.8f}',
             f'{row["val_ssim"]:.8f}',
+            f'{row["val_local_mae"]:.8f}',
+            f'{row["val_local_mse"]:.8f}',
             f'{row["lr"]:.10f}',
             f'{row["epoch_time"]:.4f}',
             f'{row["gpu_mem_mb"]:.2f}',
@@ -243,7 +265,15 @@ def batch_ssim_sum(pred, target, data_range=1.0):
 
 
 @torch.no_grad()
-def evaluate(model, loader, mae_criterion, device, amp_enabled=False):
+def evaluate(
+    model,
+    loader,
+    mae_criterion,
+    device,
+    amp_enabled=False,
+    local_top: int = 186,
+    local_bottom: int = 410,
+):
     model.eval()
 
     total_mae = 0.0
@@ -251,18 +281,28 @@ def evaluate(model, loader, mae_criterion, device, amp_enabled=False):
     total_psnr = 0.0
     total_ssim = 0.0
     total_count = 0.0
+    total_local_mae = 0.0
+    total_local_mse = 0.0
+    total_local_count = 0.0
 
     iterator = tqdm(loader, desc="val", leave=False) if is_main_process() else loader
 
-    for x, y, x_local in iterator:
+    for x, y, x_local, y_local in iterator:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         if x_local is not None:
             x_local = x_local.to(device, non_blocking=True)
+        if y_local is not None:
+            y_local = y_local.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
             pred = model(x, x_local=x_local)
             mae = mae_criterion(pred, y)
+            if y_local is not None:
+                pred_local = crop_local_region(pred, local_top, local_bottom)
+                local_mae = mae_criterion(pred_local, y_local)
+            else:
+                local_mae = pred.new_zeros(())
 
         mse = tensor_mse(pred, y).item()
         psnr = tensor_psnr(pred, y).item()
@@ -274,18 +314,28 @@ def evaluate(model, loader, mae_criterion, device, amp_enabled=False):
         total_psnr += psnr * bs
         total_ssim += ssim_sum
         total_count += bs
+        if y_local is not None:
+            local_mse = tensor_mse(pred_local, y_local).item()
+            total_local_mae += local_mae.item() * bs
+            total_local_mse += local_mse * bs
+            total_local_count += bs
 
     total_mae = reduce_sum_scalar(total_mae, device)
     total_mse = reduce_sum_scalar(total_mse, device)
     total_psnr = reduce_sum_scalar(total_psnr, device)
     total_ssim = reduce_sum_scalar(total_ssim, device)
     total_count = reduce_sum_scalar(total_count, device)
+    total_local_mae = reduce_sum_scalar(total_local_mae, device)
+    total_local_mse = reduce_sum_scalar(total_local_mse, device)
+    total_local_count = reduce_sum_scalar(total_local_count, device)
 
     metrics = {
         "val_mae": total_mae / max(total_count, 1.0),
         "val_mse": total_mse / max(total_count, 1.0),
         "val_psnr": total_psnr / max(total_count, 1.0),
         "val_ssim": total_ssim / max(total_count, 1.0),
+        "val_local_mae": total_local_mae / max(total_local_count, 1.0),
+        "val_local_mse": total_local_mse / max(total_local_count, 1.0),
     }
     return metrics
 
@@ -367,6 +417,11 @@ def main():
     if is_main_process():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
+        logger.info(
+            f"lambda_global: {args.lambda_global}  lambda_local: {args.lambda_local}  "
+            f"local_crop: ({args.local_top}, {args.local_bottom})"
+        )
+        logger.info(f"report_local_metrics: {args.report_local_metrics}")
         if args.arch == "hybrid_unet_facts":
             logger.info(
                 "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
@@ -374,7 +429,8 @@ def main():
             )
             logger.info(f"use_local_branch: {args.use_local_branch}")
 
-    local_crop = (186, 410) if args.use_local_branch else None
+    needs_local_data = args.use_local_branch or args.lambda_local > 0.0 or args.report_local_metrics
+    local_crop = (args.local_top, args.local_bottom) if needs_local_data else None
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
         image_mode=args.image_mode,
@@ -454,6 +510,7 @@ def main():
         hybrid_ffn_dropout=args.hybrid_ffn_dropout,
         hybrid_drop_path=args.hybrid_drop_path,
         use_local_branch=args.use_local_branch,
+        local_crop=(args.local_top, args.local_bottom),
     ).to(device)
 
     if use_ddp:
@@ -491,37 +548,62 @@ def main():
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
 
-            train_mae_sum = 0.0
+            train_loss_sum = 0.0
+            train_loss_global_sum = 0.0
+            train_loss_local_sum = 0.0
             train_count = 0.0
+            train_local_count = 0.0
 
             iterator = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}") if is_main_process() else train_loader
 
-            for x, y, x_local in iterator:
+            for x, y, x_local, y_local in iterator:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 if x_local is not None:
                     x_local = x_local.to(device, non_blocking=True)
+                if y_local is not None:
+                    y_local = y_local.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
                     pred = model(x, x_local=x_local)
-                    loss = mae_criterion(pred, y)
+                    loss_global = mae_criterion(pred, y)
+                    if y_local is not None:
+                        pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
+                        loss_local = mae_criterion(pred_local, y_local)
+                    else:
+                        loss_local = pred.new_zeros(())
+                    loss = args.lambda_global * loss_global + args.lambda_local * loss_local
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
                 bs = x.size(0)
-                train_mae_sum += loss.item() * bs
+                train_loss_sum += loss.item() * bs
+                train_loss_global_sum += loss_global.item() * bs
                 train_count += bs
+                if y_local is not None:
+                    train_loss_local_sum += loss_local.item() * bs
+                    train_local_count += bs
 
                 if is_main_process():
-                    iterator.set_postfix(mae=f"{loss.item():.6f}")
+                    iterator.set_postfix(
+                        loss=f"{loss.item():.6f}",
+                        global_l1=f"{loss_global.item():.6f}",
+                        local_l1=f"{loss_local.item():.6f}",
+                    )
 
-            train_mae_sum = reduce_sum_scalar(train_mae_sum, device)
+            train_loss_sum = reduce_sum_scalar(train_loss_sum, device)
+            train_loss_global_sum = reduce_sum_scalar(train_loss_global_sum, device)
+            train_loss_local_sum = reduce_sum_scalar(train_loss_local_sum, device)
             train_count = reduce_sum_scalar(train_count, device)
-            train_mae = train_mae_sum / max(train_count, 1.0)
+            train_local_count = reduce_sum_scalar(train_local_count, device)
+            train_loss = train_loss_sum / max(train_count, 1.0)
+            train_loss_global = train_loss_global_sum / max(train_count, 1.0)
+            train_loss_local = train_loss_local_sum / max(train_local_count, 1.0)
+            train_mae = train_loss_global
 
             val_metrics = evaluate(
                 model=model,
@@ -529,12 +611,16 @@ def main():
                 mae_criterion=mae_criterion,
                 device=device,
                 amp_enabled=amp_enabled,
+                local_top=args.local_top,
+                local_bottom=args.local_bottom,
             )
 
             val_mae = val_metrics["val_mae"]
             val_mse = val_metrics["val_mse"]
             val_psnr = val_metrics["val_psnr"]
             val_ssim = val_metrics["val_ssim"]
+            val_local_mae = val_metrics["val_local_mae"]
+            val_local_mse = val_metrics["val_local_mse"]
 
             lr = optimizer.param_groups[0]["lr"]
             epoch_time = time.time() - epoch_start_time
@@ -556,11 +642,16 @@ def main():
 
                 row = {
                     "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_loss_global": train_loss_global,
+                    "train_loss_local": train_loss_local,
                     "train_mae": train_mae,
                     "val_mae": val_mae,
                     "val_mse": val_mse,
                     "val_psnr": val_psnr,
                     "val_ssim": val_ssim,
+                    "val_local_mae": val_local_mae,
+                    "val_local_mse": val_local_mse,
                     "lr": lr,
                     "epoch_time": epoch_time,
                     "gpu_mem_mb": gpu_mem_mb,
@@ -585,11 +676,19 @@ def main():
 
                 logger.info(f"[Epoch {epoch}/{args.epochs}]")
                 logger.info(
-                    f"train_mae: {train_mae:.4f}  val_mae: {val_mae:.4f}"
+                    f"train_loss: {train_loss:.4f}  train_loss_global: {train_loss_global:.4f}  "
+                    f"train_loss_local: {train_loss_local:.4f}"
                 )
                 logger.info(
                     f"val_mse: {val_mse:.4f}  val_psnr: {val_psnr:.4f}  val_ssim: {val_ssim:.4f}"
                 )
+                logger.info(
+                    f"train_mae(global_l1): {train_mae:.4f}  val_mae: {val_mae:.4f}"
+                )
+                if args.report_local_metrics or local_crop is not None:
+                    logger.info(
+                        f"val_local_mae: {val_local_mae:.4f}  val_local_mse: {val_local_mse:.4f}"
+                    )
                 logger.info(
                     f"lr: {lr:.6f}  epoch_time: {epoch_time:.1f}s  gpu_mem: {gpu_mem_mb:.0f}MB"
                 )

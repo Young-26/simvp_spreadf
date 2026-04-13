@@ -27,6 +27,7 @@ class SimVPForecast(nn.Module):
         hybrid_ffn_dropout: float = 0.1,
         hybrid_drop_path: float = 0.1,
         use_local_branch: bool = False,
+        local_crop: tuple[int, int] = (186, 410),
     ):
         super().__init__()
         self.arch = arch.lower()
@@ -57,6 +58,7 @@ class SimVPForecast(nn.Module):
                 ffn_dropout=hybrid_ffn_dropout,
                 drop_path=hybrid_drop_path,
                 use_local_branch=use_local_branch,
+                local_crop=local_crop,
             )
         else:
             raise ValueError(f"Unsupported arch '{arch}'. Available choices: {SUPPORTED_ARCHS}.")
