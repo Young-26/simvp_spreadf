@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -49,6 +50,16 @@ def crop_local_region(seq, top: int, bottom: int):
     return seq[:, :, :, top:bottom, :]
 
 
+def get_amp_autocast(device_type: str, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+    if device_type == "cuda" and hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
+        return torch.cuda.amp.autocast(enabled=enabled)
+    return nullcontext()
+
+
 def tensor_mse(pred, target):
     return torch.mean((pred - target) ** 2)
 
@@ -82,6 +93,64 @@ def batch_ssim_sum(pred, target, data_range=1.0):
 
         batch_sum += float(np.mean(seq_scores))
     return batch_sum
+
+
+def _resolve_ssim_window_size(height: int, width: int, preferred: int = 11) -> int:
+    window_size = min(preferred, height, width)
+    if window_size % 2 == 0:
+        window_size -= 1
+    return max(window_size, 1)
+
+
+def tensor_ssim(pred, target, data_range=1.0, window_size: int = 11, eps: float = 1e-8):
+    if pred.shape != target.shape:
+        raise ValueError(f"tensor_ssim expects matching shapes, got {pred.shape} and {target.shape}.")
+    if pred.ndim != 4:
+        raise ValueError(f"tensor_ssim expects [N, C, H, W], but got {pred.shape}.")
+
+    _, _, height, width = pred.shape
+    window_size = _resolve_ssim_window_size(height, width, preferred=window_size)
+    padding = window_size // 2
+
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+
+    pred = pred.float()
+    target = target.float()
+
+    mu_pred = torch.nn.functional.avg_pool2d(pred, kernel_size=window_size, stride=1, padding=padding)
+    mu_target = torch.nn.functional.avg_pool2d(target, kernel_size=window_size, stride=1, padding=padding)
+
+    mu_pred_sq = mu_pred.pow(2)
+    mu_target_sq = mu_target.pow(2)
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred_sq = (
+        torch.nn.functional.avg_pool2d(pred * pred, kernel_size=window_size, stride=1, padding=padding)
+        - mu_pred_sq
+    )
+    sigma_target_sq = (
+        torch.nn.functional.avg_pool2d(target * target, kernel_size=window_size, stride=1, padding=padding)
+        - mu_target_sq
+    )
+    sigma_pred_target = (
+        torch.nn.functional.avg_pool2d(pred * target, kernel_size=window_size, stride=1, padding=padding)
+        - mu_pred_target
+    )
+
+    numerator = (2.0 * mu_pred_target + c1) * (2.0 * sigma_pred_target + c2)
+    denominator = (mu_pred_sq + mu_target_sq + c1) * (sigma_pred_sq + sigma_target_sq + c2)
+    ssim_map = numerator / torch.clamp(denominator, min=eps)
+    return ssim_map.flatten(1).mean(dim=1)
+
+
+def batch_ssim_sum(pred, target, data_range=1.0):
+    batch_size, num_frames, channels, height, width = pred.shape
+    pred_frames = pred.detach().reshape(batch_size * num_frames, channels, height, width)
+    target_frames = target.detach().reshape(batch_size * num_frames, channels, height, width)
+    frame_scores = tensor_ssim(pred_frames, target_frames, data_range=data_range)
+    seq_scores = frame_scores.reshape(batch_size, num_frames).mean(dim=1)
+    return float(seq_scores.sum().item())
 
 
 def resolve_override(cli_value, saved_args: dict, key: str, default):
@@ -146,6 +215,11 @@ def main():
         hid_T=saved_args.get("hid_T", 128),
         N_S=saved_args.get("N_S", 4),
         N_T=saved_args.get("N_T", 4),
+        convlstm_hidden=saved_args.get("convlstm_hidden", "128,128,128,128"),
+        convlstm_filter_size=int(saved_args.get("convlstm_filter_size", 5)),
+        convlstm_patch_size=int(saved_args.get("convlstm_patch_size", 4)),
+        convlstm_stride=int(saved_args.get("convlstm_stride", 1)),
+        convlstm_layer_norm=bool(saved_args.get("convlstm_layer_norm", False)),
         arch=arch,
         hybrid_depth=saved_args.get("hybrid_depth", 2),
         hybrid_heads=saved_args.get("hybrid_heads", 8),
@@ -200,7 +274,7 @@ def main():
             if y_local is not None:
                 y_local = y_local.to(device, non_blocking=True)
 
-            with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+            with get_amp_autocast(device.type, amp_enabled):
                 pred = model(x, x_local=x_local, strict_local=args.strict_local_infer)
 
             mae = F.l1_loss(pred, y)

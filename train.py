@@ -5,14 +5,17 @@ import math
 import argparse
 import logging
 import traceback
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from torchvision.models import VGG16_Weights, vgg16
 
 from datasets.ionogram_manifest import IonogramManifestDataset
 from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
@@ -40,6 +43,11 @@ def parse_args():
     parser.add_argument("--hid_T", type=int, default=128)
     parser.add_argument("--N_S", type=int, default=4)
     parser.add_argument("--N_T", type=int, default=4)
+    parser.add_argument("--convlstm_hidden", type=str, default="128,128,128,128")
+    parser.add_argument("--convlstm_filter_size", type=int, default=5)
+    parser.add_argument("--convlstm_patch_size", type=int, default=4)
+    parser.add_argument("--convlstm_stride", type=int, default=1)
+    parser.add_argument("--convlstm_layer_norm", action="store_true")
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
@@ -52,6 +60,9 @@ def parse_args():
     parser.add_argument("--use_local_branch", action="store_true")
     parser.add_argument("--lambda_global", type=float, default=1.0)
     parser.add_argument("--lambda_local", type=float, default=0.5)
+    parser.add_argument("--sched", type=str, default="auto", choices=["auto", "none", "cosine"])
+    parser.add_argument("--warmup_epoch", type=int, default=0)
+    parser.add_argument("--perceptual_vgg_weights", type=str, default="")
     parser.add_argument("--local_top", type=int, default=186)
     parser.add_argument("--local_bottom", type=int, default=410)
     parser.add_argument("--report_local_metrics", action="store_true")
@@ -113,6 +124,128 @@ def compute_best_score(
     if mode == "local":
         return float(val_local_mae)
     return float(val_mae + local_weight * val_local_mae)
+
+
+def get_amp_autocast(device_type: str, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+    if device_type == "cuda" and hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
+        return torch.cuda.amp.autocast(enabled=enabled)
+    return nullcontext()
+
+
+def create_grad_scaler(device_type: str, enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device_type, enabled=enabled)
+    if device_type == "cuda" and hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "GradScaler"):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+    class _IdentityScaler:
+        def scale(self, loss):
+            return loss
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            return None
+
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state_dict):
+            return None
+
+    return _IdentityScaler()
+
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, resize_hw: tuple[int, int] = (224, 224), local_weights_path: str = ""):
+        super().__init__()
+        self.resize_hw = resize_hw
+        self.weight_source = "imagenet"
+
+        local_weights_path = str(local_weights_path).strip()
+        if local_weights_path:
+            backbone = vgg16(weights=None)
+            state_dict = torch.load(local_weights_path, map_location="cpu")
+            if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+            backbone.load_state_dict(state_dict, strict=True)
+            self.weight_source = f"local:{local_weights_path}"
+            features = backbone.features
+        else:
+            try:
+                features = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+            except Exception:
+                features = vgg16(weights=None).features
+                self.weight_source = "random"
+
+        self.blocks = nn.ModuleList(
+            [
+                features[:4].eval(),
+                features[4:9].eval(),
+                features[9:16].eval(),
+            ]
+        )
+        for block in self.blocks:
+            for param in block.parameters():
+                param.requires_grad = False
+
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _prepare(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 5:
+            raise ValueError(f"VGGPerceptualLoss expects [B, T, C, H, W], but got {x.shape}.")
+
+        batch, steps, channels, height, width = x.shape
+        x = x.reshape(batch * steps, channels, height, width)
+        if channels == 1:
+            x = x.repeat(1, 3, 1, 1)
+        elif channels != 3:
+            raise ValueError(f"VGGPerceptualLoss only supports 1 or 3 channels, but got {channels}.")
+
+        if (height, width) != self.resize_hw:
+            x = F.interpolate(x, size=self.resize_hw, mode="bilinear", align_corners=False)
+
+        x = x.float()
+        return (x - self.mean) / self.std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_features = self._prepare(pred)
+        target_features = self._prepare(target)
+
+        loss = pred_features.new_zeros(())
+        for block in self.blocks:
+            pred_features = block(pred_features)
+            target_features = block(target_features)
+            loss = loss + F.l1_loss(pred_features, target_features)
+        return loss / len(self.blocks)
+
+
+def resolve_scheduler_config(args):
+    if args.sched == "auto":
+        args.sched = "cosine" if args.arch == "convlstm" else "none"
+    if args.arch == "convlstm":
+        args.warmup_epoch = 0
+    return args
+
+
+def build_lr_scheduler(args, optimizer):
+    sched = str(args.sched).lower()
+    if sched == "none":
+        return None
+    if sched == "cosine":
+        if args.warmup_epoch != 0:
+            raise ValueError("warmup_epoch is not implemented in simvp_spreadf train.py; use 0.")
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(args.epochs), 1),
+        )
+    raise ValueError(f"Unsupported scheduler '{args.sched}'.")
 
 
 def is_dist_avail_and_initialized():
@@ -288,6 +421,68 @@ def batch_ssim_sum(pred, target, data_range=1.0):
     return batch_sum
 
 
+def _resolve_ssim_window_size(height: int, width: int, preferred: int = 11) -> int:
+    window_size = min(preferred, height, width)
+    if window_size % 2 == 0:
+        window_size -= 1
+    return max(window_size, 1)
+
+
+def tensor_ssim(pred, target, data_range=1.0, window_size: int = 11, eps: float = 1e-8):
+    if pred.shape != target.shape:
+        raise ValueError(f"tensor_ssim expects matching shapes, got {pred.shape} and {target.shape}.")
+    if pred.ndim != 4:
+        raise ValueError(f"tensor_ssim expects [N, C, H, W], but got {pred.shape}.")
+
+    _, _, height, width = pred.shape
+    window_size = _resolve_ssim_window_size(height, width, preferred=window_size)
+    padding = window_size // 2
+
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+
+    pred = pred.float()
+    target = target.float()
+
+    mu_pred = torch.nn.functional.avg_pool2d(pred, kernel_size=window_size, stride=1, padding=padding)
+    mu_target = torch.nn.functional.avg_pool2d(target, kernel_size=window_size, stride=1, padding=padding)
+
+    mu_pred_sq = mu_pred.pow(2)
+    mu_target_sq = mu_target.pow(2)
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred_sq = (
+        torch.nn.functional.avg_pool2d(pred * pred, kernel_size=window_size, stride=1, padding=padding)
+        - mu_pred_sq
+    )
+    sigma_target_sq = (
+        torch.nn.functional.avg_pool2d(target * target, kernel_size=window_size, stride=1, padding=padding)
+        - mu_target_sq
+    )
+    sigma_pred_target = (
+        torch.nn.functional.avg_pool2d(pred * target, kernel_size=window_size, stride=1, padding=padding)
+        - mu_pred_target
+    )
+
+    numerator = (2.0 * mu_pred_target + c1) * (2.0 * sigma_pred_target + c2)
+    denominator = (mu_pred_sq + mu_target_sq + c1) * (sigma_pred_sq + sigma_target_sq + c2)
+    ssim_map = numerator / torch.clamp(denominator, min=eps)
+    return ssim_map.flatten(1).mean(dim=1)
+
+
+def batch_ssim_sum(pred, target, data_range=1.0):
+    """
+    返回当前 batch 的 SSIM 累加和，便于跨卡 all_reduce 后再除总样本数。
+    pred, target: [B, T, C, H, W]
+    """
+    batch_size, num_frames, channels, height, width = pred.shape
+    pred_frames = pred.detach().reshape(batch_size * num_frames, channels, height, width)
+    target_frames = target.detach().reshape(batch_size * num_frames, channels, height, width)
+    frame_scores = tensor_ssim(pred_frames, target_frames, data_range=data_range)
+    seq_scores = frame_scores.reshape(batch_size, num_frames).mean(dim=1)
+    return float(seq_scores.sum().item())
+
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -320,7 +515,7 @@ def evaluate(
         if y_local is not None:
             y_local = y_local.to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+        with get_amp_autocast(device.type, amp_enabled):
             pred = model(x, x_local=x_local, strict_local=strict_local)
             mae = mae_criterion(pred, y)
             if y_local is not None:
@@ -437,6 +632,11 @@ def write_report(
 
 def main():
     args = parse_args()
+    args = resolve_scheduler_config(args)
+    args.train_loss_mode = (
+        "0.15*MAE + 0.8*MSE + 0.05*perceptual" if args.arch == "convlstm"
+        else "lambda_global*global_l1 + lambda_local*local_l1"
+    )
 
     use_ddp, rank, world_size, local_rank = setup_distributed()
     set_seed(args.seed + rank)
@@ -474,6 +674,8 @@ def main():
     if is_main_process():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
+        logger.info(f"train_loss_mode: {args.train_loss_mode}")
+        logger.info(f"sched: {args.sched}  warmup_epoch: {args.warmup_epoch}")
         logger.info(
             f"lambda_global: {args.lambda_global}  lambda_local: {args.lambda_local}  "
             f"local_crop: ({args.local_top}, {args.local_bottom})"
@@ -489,6 +691,14 @@ def main():
                 "and lightweight temporal-conv skip forecasters."
             )
             logger.info(f"use_local_branch: {args.use_local_branch}")
+        if args.arch == "convlstm":
+            logger.info(
+                f"convlstm_hidden: {args.convlstm_hidden}  "
+                f"filter_size: {args.convlstm_filter_size}  "
+                f"patch_size: {args.convlstm_patch_size}  "
+                f"stride: {args.convlstm_stride}  "
+                f"layer_norm: {args.convlstm_layer_norm}"
+            )
 
     # Local targets are always kept available because local metrics and best-model
     # selection can depend on them even when local logging is disabled.
@@ -564,6 +774,11 @@ def main():
         hid_T=args.hid_T,
         N_S=args.N_S,
         N_T=args.N_T,
+        convlstm_hidden=args.convlstm_hidden,
+        convlstm_filter_size=args.convlstm_filter_size,
+        convlstm_patch_size=args.convlstm_patch_size,
+        convlstm_stride=args.convlstm_stride,
+        convlstm_layer_norm=args.convlstm_layer_norm,
         arch=args.arch,
         hybrid_depth=args.hybrid_depth,
         hybrid_heads=args.hybrid_heads,
@@ -584,12 +799,30 @@ def main():
         )
 
     mae_criterion = nn.L1Loss()
+    mse_criterion = nn.MSELoss()
+    perceptual_criterion = None
+    if args.arch == "convlstm":
+        perceptual_criterion = VGGPerceptualLoss(
+            local_weights_path=args.perceptual_vgg_weights,
+        ).to(device)
+        perceptual_criterion.eval()
+        if is_main_process():
+            if perceptual_criterion.weight_source == "random":
+                logger.warning(
+                    "ConvLSTM perceptual loss backend: VGG16 random weights. "
+                    "Provide --perceptual_vgg_weights or cache ImageNet weights locally for a stronger perceptual loss."
+                )
+            else:
+                logger.info(
+                    f"ConvLSTM perceptual loss backend: VGG16 ({perceptual_criterion.weight_source} weights)"
+                )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    scheduler = build_lr_scheduler(args, optimizer)
+    scaler = create_grad_scaler(device.type, amp_enabled)
 
     best_epoch = 0
     best_val_mae = float("inf")
@@ -614,6 +847,8 @@ def main():
             train_loss_sum = 0.0
             train_loss_global_sum = 0.0
             train_loss_local_sum = 0.0
+            train_mse_sum = 0.0
+            train_perceptual_sum = 0.0
             train_count = 0.0
             train_local_count = 0.0
 
@@ -629,15 +864,26 @@ def main():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                with get_amp_autocast(device.type, amp_enabled):
                     pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
-                    loss_global = mae_criterion(pred, y)
-                    if y_local is not None:
-                        pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
-                        loss_local = mae_criterion(pred_local, y_local)
-                    else:
+                    loss_mae = mae_criterion(pred, y)
+                    loss_mse = mse_criterion(pred, y)
+                    if args.arch == "convlstm":
                         loss_local = pred.new_zeros(())
-                    loss = args.lambda_global * loss_global + args.lambda_local * loss_local
+                        loss = None
+                    else:
+                        if y_local is not None:
+                            pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
+                            loss_local = mae_criterion(pred_local, y_local)
+                        else:
+                            loss_local = pred.new_zeros(())
+                        loss = args.lambda_global * loss_mae + args.lambda_local * loss_local
+
+                if args.arch == "convlstm":
+                    loss_perceptual = perceptual_criterion(pred.float(), y.float())
+                    loss = 0.15 * loss_mae + 0.8 * loss_mse + 0.05 * loss_perceptual
+                else:
+                    loss_perceptual = pred.new_zeros(())
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -645,27 +891,41 @@ def main():
 
                 bs = x.size(0)
                 train_loss_sum += loss.item() * bs
-                train_loss_global_sum += loss_global.item() * bs
+                train_loss_global_sum += loss_mae.item() * bs
+                train_mse_sum += loss_mse.item() * bs
+                train_perceptual_sum += loss_perceptual.item() * bs
                 train_count += bs
-                if y_local is not None:
+                if args.arch != "convlstm" and y_local is not None:
                     train_loss_local_sum += loss_local.item() * bs
                     train_local_count += bs
 
                 if is_main_process():
-                    iterator.set_postfix(
-                        loss=f"{loss.item():.6f}",
-                        global_l1=f"{loss_global.item():.6f}",
-                        local_l1=f"{loss_local.item():.6f}",
-                    )
+                    if args.arch == "convlstm":
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mae=f"{loss_mae.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
+                            perceptual=f"{loss_perceptual.item():.6f}",
+                        )
+                    else:
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            global_l1=f"{loss_mae.item():.6f}",
+                            local_l1=f"{loss_local.item():.6f}",
+                        )
 
             train_loss_sum = reduce_sum_scalar(train_loss_sum, device)
             train_loss_global_sum = reduce_sum_scalar(train_loss_global_sum, device)
             train_loss_local_sum = reduce_sum_scalar(train_loss_local_sum, device)
+            train_mse_sum = reduce_sum_scalar(train_mse_sum, device)
+            train_perceptual_sum = reduce_sum_scalar(train_perceptual_sum, device)
             train_count = reduce_sum_scalar(train_count, device)
             train_local_count = reduce_sum_scalar(train_local_count, device)
             train_loss = train_loss_sum / max(train_count, 1.0)
             train_loss_global = train_loss_global_sum / max(train_count, 1.0)
             train_loss_local = train_loss_local_sum / max(train_local_count, 1.0)
+            train_mse = train_mse_sum / max(train_count, 1.0)
+            train_perceptual = train_perceptual_sum / max(train_count, 1.0)
             train_mae = train_loss_global
 
             val_metrics = evaluate(
@@ -729,6 +989,10 @@ def main():
                     "train_loss_global": train_loss_global,
                     "train_loss_local": train_loss_local,
                     "train_mae": train_mae,
+                    "train_mse": train_mse,
+                    "train_perceptual": train_perceptual,
+                    "train_loss_mode": args.train_loss_mode,
+                    "sched": args.sched,
                     "val_mae": val_mae,
                     "val_mse": val_mse,
                     "val_psnr": val_psnr,
@@ -762,16 +1026,20 @@ def main():
                 )
 
                 logger.info(f"[Epoch {epoch}/{args.epochs}]")
-                logger.info(
-                    f"train_loss: {train_loss:.4f}  train_loss_global: {train_loss_global:.4f}  "
-                    f"train_loss_local: {train_loss_local:.4f}"
-                )
+                if args.arch == "convlstm":
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                        f"train_mse: {train_mse:.4f}  train_perceptual: {train_perceptual:.4f}"
+                    )
+                else:
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_loss_global: {train_loss_global:.4f}  "
+                        f"train_loss_local: {train_loss_local:.4f}"
+                    )
                 logger.info(
                     f"val_mse: {val_mse:.4f}  val_psnr: {val_psnr:.4f}  val_ssim: {val_ssim:.4f}"
                 )
-                logger.info(
-                    f"train_mae(global_l1): {train_mae:.4f}  val_mae: {val_mae:.4f}"
-                )
+                logger.info(f"train_mae(global_l1): {train_mae:.4f}  val_mae: {val_mae:.4f}")
                 logger.info(
                     f"best_metric_mode: {args.best_metric_mode}  epoch_best_score: {epoch_best_score:.4f}"
                 )
@@ -803,6 +1071,9 @@ def main():
                         best_metric_mode=args.best_metric_mode,
                     )
                     logger.info(f"{refresh_reason}. Saving best checkpoint to {best_path}")
+
+            if scheduler is not None:
+                scheduler.step()
 
             completed_epochs = epoch
 

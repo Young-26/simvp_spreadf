@@ -1,10 +1,11 @@
 import torch.nn as nn
 
+from .convlstm_model import ConvLSTM_Model
 from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
 
 
-SUPPORTED_ARCHS = ("simvp", "hybrid_unet_facts")
+SUPPORTED_ARCHS = ("simvp", "hybrid_unet_facts", "convlstm")
 
 
 class SimVPForecast(nn.Module):
@@ -19,6 +20,11 @@ class SimVPForecast(nn.Module):
         hid_T: int = 128,
         N_S: int = 4,
         N_T: int = 4,
+        convlstm_hidden: str = "128,128,128,128",
+        convlstm_filter_size: int = 5,
+        convlstm_patch_size: int = 4,
+        convlstm_stride: int = 1,
+        convlstm_layer_norm: bool = False,
         arch: str = "simvp",
         hybrid_depth: int = 2,
         hybrid_heads: int = 8,
@@ -43,6 +49,16 @@ class SimVPForecast(nn.Module):
                 hid_T=hid_T,
                 N_S=N_S,
                 N_T=N_T,
+            )
+        elif self.arch == "convlstm":
+            self.backbone = ConvLSTM_Model(
+                shape_in=(in_T, C, H, W),
+                out_T=out_T,
+                num_hidden=convlstm_hidden,
+                filter_size=convlstm_filter_size,
+                patch_size=convlstm_patch_size,
+                stride=convlstm_stride,
+                layer_norm=convlstm_layer_norm,
             )
         elif self.arch == "hybrid_unet_facts":
             self.backbone = HybridUNetFacTS(

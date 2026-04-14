@@ -83,6 +83,8 @@ class IonogramManifestDataset(Dataset):
         sample = {
             "x": x,
             "y": y,
+            "dataset_idx": item.get("dataset_idx", idx),
+            "sample_id": item.get("sample_id", item.get("sequence_id", str(idx))),
             "label": item.get("label", None),
             "sequence_id": item.get("sequence_id", str(idx)),
             "year": item.get("year", None),
