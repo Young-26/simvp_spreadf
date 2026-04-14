@@ -73,6 +73,13 @@ class ConvLSTMCell(nn.Module):
     def __init__(self, in_channel, num_hidden, height, width, filter_size, stride, layer_norm):
         super().__init__()
 
+        if stride != 1:
+            raise ValueError(
+                "simvp_spreadf ConvLSTM currently only supports convlstm_stride=1. "
+                "stride>1 changes hidden/cell spatial sizes and LayerNorm assumptions, "
+                "but this integration keeps the OpenSTL-style same-resolution state update."
+            )
+
         self.num_hidden = num_hidden
         padding = filter_size // 2
         if layer_norm:
@@ -155,6 +162,13 @@ class ConvLSTM_Model(nn.Module):
         self.num_layers = len(self.num_hidden)
         self.frame_channel = patch_size * patch_size * channels
 
+        if stride != 1:
+            raise ValueError(
+                "simvp_spreadf ConvLSTM currently only supports convlstm_stride=1. "
+                "The migrated OpenSTL cell stack assumes same-resolution hidden/cell states, "
+                "so stride>1 is explicitly blocked until the full spatial-size chain is reworked."
+            )
+
         patch_h = height // patch_size
         patch_w = width // patch_size
         if patch_h * patch_size != height or patch_w * patch_size != width:
@@ -214,6 +228,9 @@ class ConvLSTM_Model(nn.Module):
         x_gen = None
         total_steps = in_steps + self.out_T - 1
 
+        # For the current 8->2 ionogram task, short-horizon autoregressive rollout is sufficient.
+        # We intentionally do not restore OpenSTL scheduled sampling here; if output horizons grow,
+        # revisit teacher forcing / scheduled sampling instead of silently changing this path.
         for t in range(total_steps):
             net = frames[:, t] if t < in_steps else x_gen
 

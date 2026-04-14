@@ -51,6 +51,12 @@ class SimVPForecast(nn.Module):
                 N_T=N_T,
             )
         elif self.arch == "convlstm":
+            if convlstm_stride != 1:
+                raise ValueError(
+                    "ConvLSTM in simvp_spreadf only supports convlstm_stride=1. "
+                    "stride>1 is not wired through the hidden-state spatial shapes, LayerNorm, "
+                    "or output reconstruction path."
+                )
             self.backbone = ConvLSTM_Model(
                 shape_in=(in_T, C, H, W),
                 out_T=out_T,

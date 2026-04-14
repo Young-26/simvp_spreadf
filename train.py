@@ -60,6 +60,14 @@ def parse_args():
     parser.add_argument("--use_local_branch", action="store_true")
     parser.add_argument("--lambda_global", type=float, default=1.0)
     parser.add_argument("--lambda_local", type=float, default=0.5)
+    parser.add_argument("--loss_mae_weight", type=float, default=0.15)
+    parser.add_argument("--loss_mse_weight", type=float, default=0.80)
+    parser.add_argument("--loss_percep_weight", type=float, default=0.05)
+    parser.add_argument(
+        "--disable_perceptual_when_untrained_vgg",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--sched", type=str, default="auto", choices=["auto", "none", "cosine"])
     parser.add_argument("--warmup_epoch", type=int, default=0)
     parser.add_argument("--perceptual_vgg_weights", type=str, default="")
@@ -69,8 +77,8 @@ def parse_args():
     parser.add_argument(
         "--best_metric_mode",
         type=str,
-        default="combined",
-        choices=["global", "local", "combined"],
+        default="auto",
+        choices=["auto", "global", "local", "combined", "clarity"],
     )
     parser.add_argument("--best_metric_local_weight", type=float, default=1.0)
 
@@ -116,6 +124,10 @@ def crop_local_region(seq, top: int, bottom: int):
 def compute_best_score(
     val_mae: float,
     val_local_mae: float,
+    val_mse: float,
+    val_local_mse: float,
+    val_ssim: float,
+    val_perceptual: float,
     mode: str,
     local_weight: float,
 ) -> float:
@@ -123,6 +135,14 @@ def compute_best_score(
         return float(val_mae)
     if mode == "local":
         return float(val_local_mae)
+    if mode == "clarity":
+        # Lower is better. Favor structural sharpness first, then pixel fidelity.
+        return float(
+            0.55 * max(0.0, 1.0 - val_ssim)
+            + 0.25 * val_mse
+            + 0.15 * val_local_mse
+            + 0.05 * val_perceptual
+        )
     return float(val_mae + local_weight * val_local_mae)
 
 
@@ -166,6 +186,7 @@ class VGGPerceptualLoss(nn.Module):
         super().__init__()
         self.resize_hw = resize_hw
         self.weight_source = "imagenet"
+        self.has_pretrained_weights = True
 
         local_weights_path = str(local_weights_path).strip()
         if local_weights_path:
@@ -182,6 +203,7 @@ class VGGPerceptualLoss(nn.Module):
             except Exception:
                 features = vgg16(weights=None).features
                 self.weight_source = "random"
+                self.has_pretrained_weights = False
 
         self.blocks = nn.ModuleList(
             [
@@ -226,12 +248,47 @@ class VGGPerceptualLoss(nn.Module):
         return loss / len(self.blocks)
 
 
+def resolve_best_metric_mode(args):
+    if args.best_metric_mode == "auto":
+        return "clarity" if args.arch == "convlstm" else "combined"
+    return args.best_metric_mode
+
+
 def resolve_scheduler_config(args):
     if args.sched == "auto":
         args.sched = "cosine" if args.arch == "convlstm" else "none"
     if args.arch == "convlstm":
         args.warmup_epoch = 0
     return args
+
+
+def resolve_convlstm_loss_weights(args, perceptual_criterion, logger=None):
+    weights = {
+        "mae": float(args.loss_mae_weight),
+        "mse": float(args.loss_mse_weight),
+        "perceptual": float(args.loss_percep_weight),
+    }
+    for name, value in weights.items():
+        if value < 0:
+            raise ValueError(f"ConvLSTM loss weight '{name}' must be non-negative, but got {value}.")
+
+    if args.arch != "convlstm":
+        weights["perceptual"] = 0.0
+        return weights
+
+    if weights["perceptual"] > 0:
+        has_valid_vgg = perceptual_criterion is not None and perceptual_criterion.has_pretrained_weights
+        if not has_valid_vgg and args.disable_perceptual_when_untrained_vgg:
+            if logger is not None:
+                logger.warning(
+                    "Disabling ConvLSTM perceptual loss because no pretrained VGG16 weights were loaded."
+                )
+            weights["perceptual"] = 0.0
+
+    if weights["mae"] == 0.0 and weights["mse"] == 0.0 and weights["perceptual"] == 0.0:
+        raise ValueError("ConvLSTM loss weights are all zero; at least one loss term must be enabled.")
+
+    return weights
 
 
 def build_lr_scheduler(args, optimizer):
@@ -338,8 +395,11 @@ def init_csv(csv_path: str):
                 "train_loss_global",
                 "train_loss_local",
                 "train_mae",
+                "train_mse",
+                "train_perceptual",
                 "val_mae",
                 "val_mse",
+                "val_perceptual",
                 "val_psnr",
                 "val_ssim",
                 "val_local_mae",
@@ -347,6 +407,8 @@ def init_csv(csv_path: str):
                 "best_score",
                 "best_metric_mode",
                 "lr",
+                "lr_next",
+                "sched",
                 "epoch_time",
                 "gpu_mem_mb",
                 "best_epoch",
@@ -363,8 +425,11 @@ def append_csv(csv_path: str, row: dict):
             f'{row["train_loss_global"]:.8f}',
             f'{row["train_loss_local"]:.8f}',
             f'{row["train_mae"]:.8f}',
+            f'{row["train_mse"]:.8f}',
+            f'{row["train_perceptual"]:.8f}',
             f'{row["val_mae"]:.8f}',
             f'{row["val_mse"]:.8f}',
+            f'{row["val_perceptual"]:.8f}',
             f'{row["val_psnr"]:.8f}',
             f'{row["val_ssim"]:.8f}',
             f'{row["val_local_mae"]:.8f}',
@@ -372,6 +437,8 @@ def append_csv(csv_path: str, row: dict):
             f'{row["best_score"]:.8f}',
             row["best_metric_mode"],
             f'{row["lr"]:.10f}',
+            f'{row["lr_next"]:.10f}',
+            row["sched"],
             f'{row["epoch_time"]:.4f}',
             f'{row["gpu_mem_mb"]:.2f}',
             row["best_epoch"],
@@ -493,11 +560,13 @@ def evaluate(
     local_top: int = 186,
     local_bottom: int = 410,
     strict_local: bool = False,
+    perceptual_criterion: nn.Module | None = None,
 ):
     model.eval()
 
     total_mae = 0.0
     total_mse = 0.0
+    total_perceptual = 0.0
     total_psnr = 0.0
     total_ssim = 0.0
     total_count = 0.0
@@ -525,12 +594,17 @@ def evaluate(
                 local_mae = pred.new_zeros(())
 
         mse = tensor_mse(pred, y).item()
+        if perceptual_criterion is not None:
+            perceptual = float(perceptual_criterion(pred.float(), y.float()).item())
+        else:
+            perceptual = 0.0
         psnr = tensor_psnr(pred, y).item()
         ssim_sum = batch_ssim_sum(pred, y)
         bs = x.size(0)
 
         total_mae += mae.item() * bs
         total_mse += mse * bs
+        total_perceptual += perceptual * bs
         total_psnr += psnr * bs
         total_ssim += ssim_sum
         total_count += bs
@@ -542,6 +616,7 @@ def evaluate(
 
     total_mae = reduce_sum_scalar(total_mae, device)
     total_mse = reduce_sum_scalar(total_mse, device)
+    total_perceptual = reduce_sum_scalar(total_perceptual, device)
     total_psnr = reduce_sum_scalar(total_psnr, device)
     total_ssim = reduce_sum_scalar(total_ssim, device)
     total_count = reduce_sum_scalar(total_count, device)
@@ -552,6 +627,7 @@ def evaluate(
     metrics = {
         "val_mae": total_mae / max(total_count, 1.0),
         "val_mse": total_mse / max(total_count, 1.0),
+        "val_perceptual": total_perceptual / max(total_count, 1.0),
         "val_psnr": total_psnr / max(total_count, 1.0),
         "val_ssim": total_ssim / max(total_count, 1.0),
         "val_local_mae": total_local_mae / max(total_local_count, 1.0),
@@ -566,6 +642,7 @@ def save_checkpoint(
     model,
     optimizer,
     scaler,
+    scheduler,
     args,
     best_epoch,
     best_val_mae,
@@ -580,6 +657,7 @@ def save_checkpoint(
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "args": vars(args),
         "best_epoch": best_epoch,
         "best_val_mae": best_val_mae,
@@ -633,8 +711,9 @@ def write_report(
 def main():
     args = parse_args()
     args = resolve_scheduler_config(args)
+    args.best_metric_mode = resolve_best_metric_mode(args)
     args.train_loss_mode = (
-        "0.15*MAE + 0.8*MSE + 0.05*perceptual" if args.arch == "convlstm"
+        "weighted_reconstruction" if args.arch == "convlstm"
         else "lambda_global*global_l1 + lambda_local*local_l1"
     )
 
@@ -676,15 +755,13 @@ def main():
         logger.info(f"amp_enabled: {amp_enabled}")
         logger.info(f"train_loss_mode: {args.train_loss_mode}")
         logger.info(f"sched: {args.sched}  warmup_epoch: {args.warmup_epoch}")
+        logger.info(f"best_metric_mode: {args.best_metric_mode}")
         logger.info(
             f"lambda_global: {args.lambda_global}  lambda_local: {args.lambda_local}  "
             f"local_crop: ({args.local_top}, {args.local_bottom})"
         )
         logger.info(f"report_local_metrics: {args.report_local_metrics}")
-        logger.info(
-            f"best_metric_mode: {args.best_metric_mode}  "
-            f"best_metric_local_weight: {args.best_metric_local_weight}"
-        )
+        logger.info(f"best_metric_local_weight: {args.best_metric_local_weight}")
         if args.arch == "hybrid_unet_facts":
             logger.info(
                 "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
@@ -809,19 +886,36 @@ def main():
         if is_main_process():
             if perceptual_criterion.weight_source == "random":
                 logger.warning(
-                    "ConvLSTM perceptual loss backend: VGG16 random weights. "
-                    "Provide --perceptual_vgg_weights or cache ImageNet weights locally for a stronger perceptual loss."
+                    "ConvLSTM perceptual loss backend: VGG16 random weights."
                 )
             else:
                 logger.info(
                     f"ConvLSTM perceptual loss backend: VGG16 ({perceptual_criterion.weight_source} weights)"
                 )
+    loss_weights = resolve_convlstm_loss_weights(
+        args=args,
+        perceptual_criterion=perceptual_criterion,
+        logger=logger if is_main_process() else None,
+    )
+    args.loss_mae_weight_effective = loss_weights["mae"]
+    args.loss_mse_weight_effective = loss_weights["mse"]
+    args.loss_percep_weight_effective = loss_weights["perceptual"]
+    if args.arch == "convlstm":
+        args.train_loss_mode = (
+            f"{loss_weights['mae']:.4f}*MAE + "
+            f"{loss_weights['mse']:.4f}*MSE + "
+            f"{loss_weights['perceptual']:.4f}*perceptual"
+        )
+        if is_main_process():
+            logger.info(f"resolved_train_loss_mode: {args.train_loss_mode}")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
     scheduler = build_lr_scheduler(args, optimizer)
+    if is_main_process():
+        logger.info(f"scheduler_impl: {type(scheduler).__name__ if scheduler is not None else 'None'}")
     scaler = create_grad_scaler(device.type, amp_enabled)
 
     best_epoch = 0
@@ -870,7 +964,6 @@ def main():
                     loss_mse = mse_criterion(pred, y)
                     if args.arch == "convlstm":
                         loss_local = pred.new_zeros(())
-                        loss = None
                     else:
                         if y_local is not None:
                             pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
@@ -880,8 +973,15 @@ def main():
                         loss = args.lambda_global * loss_mae + args.lambda_local * loss_local
 
                 if args.arch == "convlstm":
-                    loss_perceptual = perceptual_criterion(pred.float(), y.float())
-                    loss = 0.15 * loss_mae + 0.8 * loss_mse + 0.05 * loss_perceptual
+                    if loss_weights["perceptual"] > 0.0:
+                        loss_perceptual = perceptual_criterion(pred.float(), y.float())
+                    else:
+                        loss_perceptual = pred.new_zeros(())
+                    loss = (
+                        loss_weights["mae"] * loss_mae
+                        + loss_weights["mse"] * loss_mse
+                        + loss_weights["perceptual"] * loss_perceptual
+                    )
                 else:
                     loss_perceptual = pred.new_zeros(())
 
@@ -937,10 +1037,16 @@ def main():
                 local_top=args.local_top,
                 local_bottom=args.local_bottom,
                 strict_local=args.use_local_branch,
+                perceptual_criterion=(
+                    perceptual_criterion
+                    if args.arch == "convlstm" and loss_weights["perceptual"] > 0.0
+                    else None
+                ),
             )
 
             val_mae = val_metrics["val_mae"]
             val_mse = val_metrics["val_mse"]
+            val_perceptual = val_metrics["val_perceptual"]
             val_psnr = val_metrics["val_psnr"]
             val_ssim = val_metrics["val_ssim"]
             val_local_mae = val_metrics["val_local_mae"]
@@ -948,11 +1054,18 @@ def main():
             epoch_best_score = compute_best_score(
                 val_mae=val_mae,
                 val_local_mae=val_local_mae,
+                val_mse=val_mse,
+                val_local_mse=val_local_mse,
+                val_ssim=val_ssim,
+                val_perceptual=val_perceptual,
                 mode=args.best_metric_mode,
                 local_weight=args.best_metric_local_weight,
             )
 
             lr = optimizer.param_groups[0]["lr"]
+            if scheduler is not None:
+                scheduler.step()
+            lr_next = optimizer.param_groups[0]["lr"]
             epoch_time = time.time() - epoch_start_time
 
             if device.type == "cuda":
@@ -995,6 +1108,7 @@ def main():
                     "sched": args.sched,
                     "val_mae": val_mae,
                     "val_mse": val_mse,
+                    "val_perceptual": val_perceptual,
                     "val_psnr": val_psnr,
                     "val_ssim": val_ssim,
                     "val_local_mae": val_local_mae,
@@ -1002,6 +1116,7 @@ def main():
                     "best_score": epoch_best_score,
                     "best_metric_mode": args.best_metric_mode,
                     "lr": lr,
+                    "lr_next": lr_next,
                     "epoch_time": epoch_time,
                     "gpu_mem_mb": gpu_mem_mb,
                     "best_epoch": best_epoch,
@@ -1016,6 +1131,7 @@ def main():
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
+                    scheduler=scheduler,
                     args=args,
                     best_epoch=best_epoch,
                     best_val_mae=best_val_mae,
@@ -1037,7 +1153,8 @@ def main():
                         f"train_loss_local: {train_loss_local:.4f}"
                     )
                 logger.info(
-                    f"val_mse: {val_mse:.4f}  val_psnr: {val_psnr:.4f}  val_ssim: {val_ssim:.4f}"
+                    f"val_mse: {val_mse:.4f}  val_perceptual: {val_perceptual:.4f}  "
+                    f"val_psnr: {val_psnr:.4f}  val_ssim: {val_ssim:.4f}"
                 )
                 logger.info(f"train_mae(global_l1): {train_mae:.4f}  val_mae: {val_mae:.4f}")
                 logger.info(
@@ -1048,7 +1165,8 @@ def main():
                         f"val_local_mae: {val_local_mae:.4f}  val_local_mse: {val_local_mse:.4f}"
                     )
                 logger.info(
-                    f"lr: {lr:.6f}  epoch_time: {epoch_time:.1f}s  gpu_mem: {gpu_mem_mb:.0f}MB"
+                    f"lr_used: {lr:.6f}  lr_next: {lr_next:.6f}  epoch_time: {epoch_time:.1f}s  "
+                    f"gpu_mem: {gpu_mem_mb:.0f}MB"
                 )
                 logger.info(
                     f"best_epoch: {best_epoch}  best_val_mae: {best_val_mae:.4f}  best_score: {best_score:.4f}"
@@ -1062,6 +1180,7 @@ def main():
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
+                        scheduler=scheduler,
                         args=args,
                         best_epoch=best_epoch,
                         best_val_mae=best_val_mae,
@@ -1071,9 +1190,6 @@ def main():
                         best_metric_mode=args.best_metric_mode,
                     )
                     logger.info(f"{refresh_reason}. Saving best checkpoint to {best_path}")
-
-            if scheduler is not None:
-                scheduler.step()
 
             completed_epochs = epoch
 
@@ -1107,6 +1223,7 @@ def main():
                         model=model,
                         optimizer=optimizer if "optimizer" in locals() else None,
                         scaler=scaler if "scaler" in locals() else None,
+                        scheduler=scheduler if "scheduler" in locals() else None,
                         args=args,
                         best_epoch=best_epoch,
                         best_val_mae=best_val_mae,
