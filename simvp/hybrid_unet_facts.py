@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -915,7 +915,7 @@ class HybridUNetFacTS(nn.Module):
         x_local: Optional[torch.Tensor] = None,
         return_aux: bool = False,
         strict_local: bool = False,
-    ) -> torch.Tensor | Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         batch_size, num_frames, channels, height, width = x.shape
         if num_frames != self.in_T:
             raise ValueError(f"Expected {self.in_T} input frames, but got {num_frames}.")

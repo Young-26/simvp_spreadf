@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +15,7 @@ class IonogramManifestDataset(Dataset):
         image_mode: str = "L",   # "L" or "RGB"
         image_size: int = 448,
         normalize_to_01: bool = True,
-        local_crop: tuple[int, int] | None = (186, 410),
+        local_crop: Optional[Tuple[int, int]] = (186, 410),
     ):
         self.manifest_path = Path(manifest_path)
         self.image_mode = image_mode

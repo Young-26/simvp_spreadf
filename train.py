@@ -6,6 +6,7 @@ import argparse
 import logging
 import traceback
 from contextlib import nullcontext
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -182,7 +183,7 @@ def create_grad_scaler(device_type: str, enabled: bool):
 
 
 class VGGPerceptualLoss(nn.Module):
-    def __init__(self, resize_hw: tuple[int, int] = (224, 224), local_weights_path: str = ""):
+    def __init__(self, resize_hw: Tuple[int, int] = (224, 224), local_weights_path: str = ""):
         super().__init__()
         self.resize_hw = resize_hw
         self.weight_source = "imagenet"
@@ -560,7 +561,7 @@ def evaluate(
     local_top: int = 186,
     local_bottom: int = 410,
     strict_local: bool = False,
-    perceptual_criterion: nn.Module | None = None,
+    perceptual_criterion: Optional[nn.Module] = None,
 ):
     model.eval()
 
@@ -648,8 +649,8 @@ def save_checkpoint(
     best_val_mae,
     history,
     status,
-    best_score: float | None = None,
-    best_metric_mode: str | None = None,
+    best_score: Optional[float] = None,
+    best_metric_mode: Optional[str] = None,
 ):
     raw_model = unwrap_model(model)
     ckpt = {
@@ -680,8 +681,8 @@ def write_report(
     best_epoch,
     best_val_mae,
     history,
-    best_score: float | None = None,
-    best_metric_mode: str | None = None,
+    best_score: Optional[float] = None,
+    best_metric_mode: Optional[str] = None,
 ):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("SimVP Training Report\n")

@@ -1,4 +1,5 @@
 import torch.nn as nn
+from typing import Tuple
 
 from .convlstm_model import ConvLSTM_Model
 from .hybrid_unet_facts import HybridUNetFacTS
@@ -33,7 +34,7 @@ class SimVPForecast(nn.Module):
         hybrid_ffn_dropout: float = 0.1,
         hybrid_drop_path: float = 0.1,
         use_local_branch: bool = False,
-        local_crop: tuple[int, int] = (186, 410),
+        local_crop: Tuple[int, int] = (186, 410),
     ):
         super().__init__()
         self.arch = arch.lower()
