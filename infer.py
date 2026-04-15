@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("--in_T", type=int, default=None)
     parser.add_argument("--out_T", type=int, default=None)
     parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
+    parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=["simvp", "openstl"])
     parser.add_argument("--use_local_branch", action="store_true", default=None)
     parser.add_argument("--local_top", type=int, default=None)
     parser.add_argument("--local_bottom", type=int, default=None)
@@ -194,6 +195,7 @@ def main():
     in_T = resolve_saved_first(saved_args, "in_T", args.in_T, 8)
     out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
     arch = resolve_override(args.arch, saved_args, "arch", "simvp")
+    predrnnpp_recipe = resolve_override(args.predrnnpp_recipe, saved_args, "predrnnpp_recipe", "simvp")
     use_local_branch = resolve_override(args.use_local_branch, saved_args, "use_local_branch", False)
     local_top = resolve_saved_first(saved_args, "local_top", args.local_top, 186)
     local_bottom = resolve_saved_first(saved_args, "local_bottom", args.local_bottom, 410)
@@ -225,6 +227,8 @@ def main():
         predrnnpp_patch_size=int(saved_args.get("predrnnpp_patch_size", 4)),
         predrnnpp_stride=int(saved_args.get("predrnnpp_stride", 1)),
         predrnnpp_layer_norm=bool(saved_args.get("predrnnpp_layer_norm", False)),
+        predrnnpp_recipe=predrnnpp_recipe,
+        predrnnpp_reverse_scheduled_sampling=bool(saved_args.get("reverse_scheduled_sampling", False)),
         arch=arch,
         hybrid_depth=saved_args.get("hybrid_depth", 2),
         hybrid_heads=saved_args.get("hybrid_heads", 8),
@@ -296,6 +300,8 @@ def main():
 
             if batch_idx == 1:
                 print(f"arch: {arch}")
+                if arch == "predrnnpp":
+                    print(f"predrnnpp_recipe: {predrnnpp_recipe}")
                 print(f"input shape:  {tuple(x.shape)}")
                 print(f"target shape: {tuple(y.shape)}")
                 if x_local is not None:

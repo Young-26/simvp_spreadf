@@ -32,6 +32,8 @@ class SimVPForecast(nn.Module):
         predrnnpp_patch_size: int = 4,
         predrnnpp_stride: int = 1,
         predrnnpp_layer_norm: bool = False,
+        predrnnpp_recipe: str = "simvp",
+        predrnnpp_reverse_scheduled_sampling: bool = False,
         arch: str = "simvp",
         hybrid_depth: int = 2,
         hybrid_heads: int = 8,
@@ -45,9 +47,14 @@ class SimVPForecast(nn.Module):
         super().__init__()
         self.arch = arch.lower()
         self.out_T = out_T
+        self.predrnnpp_recipe = str(predrnnpp_recipe).lower()
 
         if use_local_branch and self.arch != "hybrid_unet_facts":
             raise ValueError("The local F-region branch is only supported by 'hybrid_unet_facts'.")
+        if self.arch == "predrnnpp" and self.predrnnpp_recipe not in ("simvp", "openstl"):
+            raise ValueError(
+                f"Unsupported PredRNN++ recipe '{predrnnpp_recipe}'. Available choices: ('simvp', 'openstl')."
+            )
 
         if self.arch == "simvp":
             self.backbone = SimVP(
@@ -88,6 +95,7 @@ class SimVPForecast(nn.Module):
                 patch_size=predrnnpp_patch_size,
                 stride=predrnnpp_stride,
                 layer_norm=predrnnpp_layer_norm,
+                reverse_scheduled_sampling=predrnnpp_reverse_scheduled_sampling,
             )
         elif self.arch == "hybrid_unet_facts":
             self.backbone = HybridUNetFacTS(
@@ -108,15 +116,41 @@ class SimVPForecast(nn.Module):
         else:
             raise ValueError(f"Unsupported arch '{arch}'. Available choices: {SUPPORTED_ARCHS}.")
 
-    def forward(self, x, x_local=None, return_aux: bool = False, strict_local: bool = False):
+    def forward(
+        self,
+        x,
+        x_local=None,
+        return_aux: bool = False,
+        strict_local: bool = False,
+        mask_true=None,
+        return_loss: bool = False,
+        loss_target=None,
+    ):
         """
         x: [B, in_T, C, H, W]
         return: [B, out_T, C, H, W]
         """
+        if return_loss and self.arch != "predrnnpp":
+            raise ValueError("return_loss is only supported for arch='predrnnpp'.")
+
         if self.arch == "hybrid_unet_facts":
             y = self.backbone(x, x_local=x_local, return_aux=return_aux, strict_local=strict_local)
+        elif self.arch == "predrnnpp":
+            y = self.backbone(
+                x,
+                mask_true=mask_true,
+                return_loss=return_loss,
+                loss_target=loss_target,
+                recipe=self.predrnnpp_recipe,
+            )
         else:
             y = self.backbone(x)
         if self.arch == "simvp":
             y = y[:, :self.out_T]
+            return y
+        if self.arch == "predrnnpp":
+            if return_loss:
+                y, loss = y
+                return y[:, -self.out_T :], loss
+            return y[:, -self.out_T :]
         return y

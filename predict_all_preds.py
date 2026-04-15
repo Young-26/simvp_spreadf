@@ -489,6 +489,7 @@ def build_model_from_ckpt_args(
     in_T = int(ckpt_args.get("in_T", 8))
     out_T = int(ckpt_args.get("out_T", 2))
     arch = str(ckpt_args.get("arch", "simvp"))
+    predrnnpp_recipe = str(ckpt_args.get("predrnnpp_recipe", "simvp"))
     use_local_branch = bool(ckpt_args.get("use_local_branch", False))
     local_top = int(ckpt_args.get("local_top", 186))
     local_bottom = int(ckpt_args.get("local_bottom", 410))
@@ -514,6 +515,8 @@ def build_model_from_ckpt_args(
         predrnnpp_patch_size=int(ckpt_args.get("predrnnpp_patch_size", 4)),
         predrnnpp_stride=int(ckpt_args.get("predrnnpp_stride", 1)),
         predrnnpp_layer_norm=bool(ckpt_args.get("predrnnpp_layer_norm", False)),
+        predrnnpp_recipe=predrnnpp_recipe,
+        predrnnpp_reverse_scheduled_sampling=bool(ckpt_args.get("reverse_scheduled_sampling", False)),
         arch=arch,
         hybrid_depth=int(ckpt_args.get("hybrid_depth", 2)),
         hybrid_heads=int(ckpt_args.get("hybrid_heads", 8)),
@@ -528,6 +531,7 @@ def build_model_from_ckpt_args(
         "in_T": in_T,
         "out_T": out_T,
         "arch": arch,
+        "predrnnpp_recipe": predrnnpp_recipe,
         "use_local_branch": use_local_branch,
         "local_crop": local_crop,
     }
@@ -680,6 +684,7 @@ def main() -> None:
     in_T = int(model_cfg["in_T"])
     out_T = int(model_cfg["out_T"])
     arch = str(model_cfg["arch"])
+    predrnnpp_recipe = str(model_cfg.get("predrnnpp_recipe", "simvp"))
     use_local_branch = bool(model_cfg["use_local_branch"])
     local_crop = tuple(model_cfg["local_crop"])
     batch_size = int(coalesce(args.batch_size, ckpt_args.get("val_batch_size"), ckpt_args.get("batch_size"), default=4))
@@ -694,6 +699,8 @@ def main() -> None:
     print(f"[Info] device={device}")
     print(f"[Info] image_mode={image_mode}, image_size={image_size}")
     print(f"[Info] arch={arch}, in_T={in_T}, out_T={out_T}, use_local_branch={use_local_branch}")
+    if arch == "predrnnpp":
+        print(f"[Info] predrnnpp_recipe={predrnnpp_recipe}")
     if use_local_branch:
         print(f"[Info] local_crop={local_crop}")
 

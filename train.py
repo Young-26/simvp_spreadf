@@ -23,11 +23,35 @@ from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
 
 
-WEIGHTED_RECONSTRUCTION_ARCHS = {"convlstm", "predrnnpp"}
+PREDRNNPP_RECIPES = ("simvp", "openstl")
 
 
-def uses_weighted_reconstruction_loss(arch: str) -> bool:
-    return str(arch).lower() in WEIGHTED_RECONSTRUCTION_ARCHS
+def get_predrnnpp_recipe(args) -> str:
+    recipe = str(getattr(args, "predrnnpp_recipe", "simvp")).lower()
+    if recipe not in PREDRNNPP_RECIPES:
+        raise ValueError(f"Unsupported PredRNN++ recipe '{recipe}'. Available choices: {PREDRNNPP_RECIPES}.")
+    return recipe
+
+
+def is_predrnnpp_arch(args) -> bool:
+    return str(args.arch).lower() == "predrnnpp"
+
+
+def uses_predrnnpp_openstl_recipe(args) -> bool:
+    return is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "openstl"
+
+
+def uses_weighted_reconstruction_loss(args) -> bool:
+    arch = str(args.arch).lower()
+    return arch == "convlstm" or (is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "simvp")
+
+
+def uses_local_reconstruction_loss(args) -> bool:
+    return not uses_weighted_reconstruction_loss(args) and not uses_predrnnpp_openstl_recipe(args)
+
+
+def resolve_recipe_tag(args) -> str:
+    return get_predrnnpp_recipe(args) if is_predrnnpp_arch(args) else "default"
 
 
 def parse_args():
@@ -61,6 +85,18 @@ def parse_args():
     parser.add_argument("--predrnnpp_patch_size", type=int, default=4)
     parser.add_argument("--predrnnpp_stride", type=int, default=1)
     parser.add_argument("--predrnnpp_layer_norm", action="store_true")
+    parser.add_argument("--predrnnpp_recipe", type=str, default="simvp", choices=PREDRNNPP_RECIPES)
+    parser.add_argument("--reverse_scheduled_sampling", action="store_true")
+    parser.add_argument(
+        "--scheduled_sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--sampling_start_value", type=float, default=1.0)
+    parser.add_argument("--sampling_stop_iter", type=int, default=50000)
+    parser.add_argument("--r_sampling_step_1", type=int, default=25000)
+    parser.add_argument("--r_sampling_step_2", type=int, default=50000)
+    parser.add_argument("--r_exp_alpha", type=float, default=5000.0)
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
@@ -81,7 +117,8 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--sched", type=str, default="auto", choices=["auto", "none", "cosine"])
+    parser.add_argument("--opt", type=str, default="auto", choices=["auto", "adam", "adamw"])
+    parser.add_argument("--sched", type=str, default="auto", choices=["auto", "none", "cosine", "onecycle"])
     parser.add_argument("--warmup_epoch", type=int, default=0)
     parser.add_argument("--perceptual_vgg_weights", type=str, default="")
     parser.add_argument("--local_top", type=int, default=186)
@@ -132,6 +169,69 @@ def collate_fn(batch):
 
 def crop_local_region(seq, top: int, bottom: int):
     return seq[:, :, :, top:bottom, :]
+
+
+def validate_patch_grid(channels: int, height: int, width: int, patch_size: int):
+    if height % patch_size != 0 or width % patch_size != 0:
+        raise ValueError(f"Input size {(height, width)} must be divisible by patch_size={patch_size}.")
+    patch_h = height // patch_size
+    patch_w = width // patch_size
+    patch_channels = channels * patch_size * patch_size
+    return patch_h, patch_w, patch_channels
+
+
+def build_predrnnpp_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    patch_h, patch_w, patch_channels = validate_patch_grid(
+        channels=channels,
+        height=height,
+        width=width,
+        patch_size=int(args.predrnnpp_patch_size),
+    )
+
+    def _expand(binary_flags: torch.Tensor) -> torch.Tensor:
+        if binary_flags.numel() == 0:
+            return torch.zeros(batch_size, 0, patch_h, patch_w, patch_channels, device=device)
+        return (
+            binary_flags.to(dtype=torch.float32)
+            .view(binary_flags.shape[0], binary_flags.shape[1], 1, 1, 1)
+            .expand(binary_flags.shape[0], binary_flags.shape[1], patch_h, patch_w, patch_channels)
+            .contiguous()
+        )
+
+    if args.reverse_scheduled_sampling:
+        if itr < args.r_sampling_step_1:
+            r_eta = 0.5
+        elif itr < args.r_sampling_step_2:
+            r_eta = 1.0 - 0.5 * math.exp(-float(itr - args.r_sampling_step_1) / float(args.r_exp_alpha))
+        else:
+            r_eta = 1.0
+
+        if itr < args.r_sampling_step_1:
+            future_eta = 0.5
+        elif itr < args.r_sampling_step_2:
+            denom = max(args.r_sampling_step_2 - args.r_sampling_step_1, 1)
+            future_eta = 0.5 - (0.5 / denom) * (itr - args.r_sampling_step_1)
+        else:
+            future_eta = 0.0
+
+        history_flags = torch.rand(batch_size, max(args.in_T - 1, 0), device=device) < r_eta
+        future_flags = torch.rand(batch_size, max(args.out_T - 1, 0), device=device) < future_eta
+        history_mask = _expand(history_flags)
+        future_mask = _expand(future_flags)
+        return eta, torch.cat([history_mask, future_mask], dim=1)
+
+    zeros = torch.zeros(batch_size, max(args.out_T - 1, 0), patch_h, patch_w, patch_channels, device=device)
+    if not args.scheduled_sampling or args.out_T <= 1:
+        return 0.0, zeros
+
+    if itr < args.sampling_stop_iter:
+        decay = float(args.sampling_start_value) / max(float(args.sampling_stop_iter), 1.0)
+        eta = max(0.0, eta - decay)
+    else:
+        eta = 0.0
+
+    future_flags = torch.rand(batch_size, max(args.out_T - 1, 0), device=device) < eta
+    return eta, _expand(future_flags)
 
 
 def compute_best_score(
@@ -263,14 +363,29 @@ class VGGPerceptualLoss(nn.Module):
 
 def resolve_best_metric_mode(args):
     if args.best_metric_mode == "auto":
-        return "clarity" if uses_weighted_reconstruction_loss(args.arch) else "combined"
+        return "clarity" if uses_weighted_reconstruction_loss(args) else "combined"
     return args.best_metric_mode
 
 
+def resolve_optimizer_config(args):
+    args.predrnnpp_recipe = get_predrnnpp_recipe(args)
+    opt = str(args.opt).lower()
+    if opt == "auto":
+        opt = "adam" if uses_predrnnpp_openstl_recipe(args) else "adamw"
+    args.opt = opt
+    return args
+
+
 def resolve_scheduler_config(args):
+    args.predrnnpp_recipe = get_predrnnpp_recipe(args)
     if args.sched == "auto":
-        args.sched = "cosine" if uses_weighted_reconstruction_loss(args.arch) else "none"
-    if uses_weighted_reconstruction_loss(args.arch):
+        if uses_predrnnpp_openstl_recipe(args):
+            args.sched = "onecycle"
+        elif uses_weighted_reconstruction_loss(args):
+            args.sched = "cosine"
+        else:
+            args.sched = "none"
+    if uses_weighted_reconstruction_loss(args) or uses_predrnnpp_openstl_recipe(args):
         args.warmup_epoch = 0
     return args
 
@@ -287,7 +402,7 @@ def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, log
                 f"Weighted reconstruction loss weight '{name}' must be non-negative, but got {value}."
             )
 
-    if not uses_weighted_reconstruction_loss(args.arch):
+    if not uses_weighted_reconstruction_loss(args):
         weights["perceptual"] = 0.0
         return weights
 
@@ -308,16 +423,63 @@ def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, log
     return weights
 
 
-def build_lr_scheduler(args, optimizer):
+def resolve_train_loss_mode(args, loss_weights=None):
+    if uses_predrnnpp_openstl_recipe(args):
+        return "mse_openstl"
+    if uses_weighted_reconstruction_loss(args):
+        if loss_weights is None:
+            return "weighted_reconstruction"
+        return (
+            f"{loss_weights['mae']:.4f}*MAE + "
+            f"{loss_weights['mse']:.4f}*MSE + "
+            f"{loss_weights['perceptual']:.4f}*perceptual"
+        )
+    return "lambda_global*global_l1 + lambda_local*local_l1"
+
+
+def build_optimizer(args, model):
+    if args.opt == "adam":
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    if args.opt == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer '{args.opt}'.")
+
+
+def build_lr_scheduler(args, optimizer, steps_per_epoch: int):
     sched = str(args.sched).lower()
     if sched == "none":
-        return None
+        return None, "epoch"
     if sched == "cosine":
         if args.warmup_epoch != 0:
             raise ValueError("warmup_epoch is not implemented in simvp_spreadf train.py; use 0.")
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(int(args.epochs), 1),
+        return (
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(int(args.epochs), 1),
+            ),
+            "epoch",
+        )
+    if sched == "onecycle":
+        if args.warmup_epoch != 0:
+            raise ValueError("warmup_epoch is not used with OneCycleLR; set --warmup_epoch 0.")
+        if steps_per_epoch < 1:
+            raise ValueError(f"OneCycleLR requires steps_per_epoch >= 1, but got {steps_per_epoch}.")
+        return (
+            torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                epochs=max(int(args.epochs), 1),
+                steps_per_epoch=int(steps_per_epoch),
+            ),
+            "iter",
         )
     raise ValueError(f"Unsupported scheduler '{args.sched}'.")
 
@@ -727,12 +889,10 @@ def write_report(
 
 def main():
     args = parse_args()
+    args = resolve_optimizer_config(args)
     args = resolve_scheduler_config(args)
     args.best_metric_mode = resolve_best_metric_mode(args)
-    args.train_loss_mode = (
-        "weighted_reconstruction" if uses_weighted_reconstruction_loss(args.arch)
-        else "lambda_global*global_l1 + lambda_local*local_l1"
-    )
+    args.train_loss_mode = resolve_train_loss_mode(args)
 
     use_ddp, rank, world_size, local_rank = setup_distributed()
     set_seed(args.seed + rank)
@@ -770,7 +930,10 @@ def main():
     if is_main_process():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
-        logger.info(f"train_loss_mode: {args.train_loss_mode}")
+        logger.info(f"resolved_recipe: {resolve_recipe_tag(args)}")
+        logger.info(f"resolved_optimizer: {args.opt}")
+        logger.info(f"resolved_scheduler: {args.sched}")
+        logger.info(f"resolved_train_loss_mode: {args.train_loss_mode}")
         logger.info(f"sched: {args.sched}  warmup_epoch: {args.warmup_epoch}")
         logger.info(f"best_metric_mode: {args.best_metric_mode}")
         logger.info(
@@ -799,7 +962,10 @@ def main():
                 f"filter_size: {args.predrnnpp_filter_size}  "
                 f"patch_size: {args.predrnnpp_patch_size}  "
                 f"stride: {args.predrnnpp_stride}  "
-                f"layer_norm: {args.predrnnpp_layer_norm}"
+                f"layer_norm: {args.predrnnpp_layer_norm}  "
+                f"recipe: {args.predrnnpp_recipe}  "
+                f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
+                f"scheduled_sampling: {args.scheduled_sampling}"
             )
 
     # Local targets are always kept available because local metrics and best-model
@@ -886,6 +1052,8 @@ def main():
         predrnnpp_patch_size=args.predrnnpp_patch_size,
         predrnnpp_stride=args.predrnnpp_stride,
         predrnnpp_layer_norm=args.predrnnpp_layer_norm,
+        predrnnpp_recipe=args.predrnnpp_recipe,
+        predrnnpp_reverse_scheduled_sampling=args.reverse_scheduled_sampling,
         arch=args.arch,
         hybrid_depth=args.hybrid_depth,
         hybrid_heads=args.hybrid_heads,
@@ -908,7 +1076,7 @@ def main():
     mae_criterion = nn.L1Loss()
     mse_criterion = nn.MSELoss()
     perceptual_criterion = None
-    if uses_weighted_reconstruction_loss(args.arch):
+    if uses_weighted_reconstruction_loss(args):
         perceptual_criterion = VGGPerceptualLoss(
             local_weights_path=args.perceptual_vgg_weights,
         ).to(device)
@@ -927,24 +1095,21 @@ def main():
         perceptual_criterion=perceptual_criterion,
         logger=logger if is_main_process() else None,
     )
-    args.loss_mae_weight_effective = loss_weights["mae"]
-    args.loss_mse_weight_effective = loss_weights["mse"]
-    args.loss_percep_weight_effective = loss_weights["perceptual"]
-    if uses_weighted_reconstruction_loss(args.arch):
-        args.train_loss_mode = (
-            f"{loss_weights['mae']:.4f}*MAE + "
-            f"{loss_weights['mse']:.4f}*MSE + "
-            f"{loss_weights['perceptual']:.4f}*perceptual"
-        )
-        if is_main_process():
-            logger.info(f"resolved_train_loss_mode: {args.train_loss_mode}")
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = build_lr_scheduler(args, optimizer)
+    if uses_weighted_reconstruction_loss(args):
+        args.loss_mae_weight_effective = loss_weights["mae"]
+        args.loss_mse_weight_effective = loss_weights["mse"]
+        args.loss_percep_weight_effective = loss_weights["perceptual"]
+    else:
+        args.loss_mae_weight_effective = 0.0
+        args.loss_mse_weight_effective = 0.0
+        args.loss_percep_weight_effective = 0.0
+    args.train_loss_mode = resolve_train_loss_mode(args, loss_weights=loss_weights)
     if is_main_process():
+        logger.info(f"resolved_train_loss_mode: {args.train_loss_mode}")
+    optimizer = build_optimizer(args, model)
+    scheduler, scheduler_step_mode = build_lr_scheduler(args, optimizer, steps_per_epoch=len(train_loader))
+    if is_main_process():
+        logger.info(f"optimizer_impl: {type(optimizer).__name__}")
         logger.info(f"scheduler_impl: {type(scheduler).__name__ if scheduler is not None else 'None'}")
     scaler = create_grad_scaler(device.type, amp_enabled)
 
@@ -956,6 +1121,8 @@ def main():
     status = "RUNNING"
     reason = ""
     completed_epochs = 0
+    global_step = 0
+    predrnnpp_sampling_eta = float(args.sampling_start_value)
 
     try:
         for epoch in range(1, args.epochs + 1):
@@ -964,6 +1131,7 @@ def main():
 
             epoch_start_time = time.time()
             model.train()
+            epoch_start_lr = optimizer.param_groups[0]["lr"]
 
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
@@ -989,20 +1157,40 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
                 with get_amp_autocast(device.type, amp_enabled):
-                    pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
-                    loss_mae = mae_criterion(pred, y)
-                    loss_mse = mse_criterion(pred, y)
-                    if uses_weighted_reconstruction_loss(args.arch):
+                    if uses_predrnnpp_openstl_recipe(args):
+                        full_sequence = torch.cat([x, y], dim=1)
+                        predrnnpp_sampling_eta, mask_true = build_predrnnpp_real_input_flag(
+                            args=args,
+                            batch_size=x.size(0),
+                            channels=x.shape[2],
+                            height=x.shape[3],
+                            width=x.shape[4],
+                            device=device,
+                            eta=predrnnpp_sampling_eta,
+                            itr=global_step,
+                        )
+                        pred, loss = model(
+                            full_sequence,
+                            mask_true=mask_true,
+                            return_loss=True,
+                        )
                         loss_local = pred.new_zeros(())
                     else:
-                        if y_local is not None:
-                            pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
-                            loss_local = mae_criterion(pred_local, y_local)
+                        pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
+                        if uses_local_reconstruction_loss(args):
+                            if y_local is not None:
+                                pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
+                                loss_local = mae_criterion(pred_local, y_local)
+                            else:
+                                loss_local = pred.new_zeros(())
+                            loss = args.lambda_global * mae_criterion(pred, y) + args.lambda_local * loss_local
                         else:
                             loss_local = pred.new_zeros(())
-                        loss = args.lambda_global * loss_mae + args.lambda_local * loss_local
 
-                if uses_weighted_reconstruction_loss(args.arch):
+                    loss_mae = mae_criterion(pred, y)
+                    loss_mse = mse_criterion(pred, y)
+
+                if uses_weighted_reconstruction_loss(args):
                     if loss_weights["perceptual"] > 0.0:
                         loss_perceptual = perceptual_criterion(pred.float(), y.float())
                     else:
@@ -1018,6 +1206,9 @@ def main():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                if scheduler is not None and scheduler_step_mode == "iter":
+                    scheduler.step()
+                global_step += 1
 
                 bs = x.size(0)
                 train_loss_sum += loss.item() * bs
@@ -1025,17 +1216,23 @@ def main():
                 train_mse_sum += loss_mse.item() * bs
                 train_perceptual_sum += loss_perceptual.item() * bs
                 train_count += bs
-                if not uses_weighted_reconstruction_loss(args.arch) and y_local is not None:
+                if uses_local_reconstruction_loss(args) and y_local is not None:
                     train_loss_local_sum += loss_local.item() * bs
                     train_local_count += bs
 
                 if is_main_process():
-                    if uses_weighted_reconstruction_loss(args.arch):
+                    if uses_weighted_reconstruction_loss(args):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mae=f"{loss_mae.item():.6f}",
                             mse=f"{loss_mse.item():.6f}",
                             perceptual=f"{loss_perceptual.item():.6f}",
+                        )
+                    elif uses_predrnnpp_openstl_recipe(args):
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mae=f"{loss_mae.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
                         )
                     else:
                         iterator.set_postfix(
@@ -1069,7 +1266,7 @@ def main():
                 strict_local=args.use_local_branch,
                 perceptual_criterion=(
                     perceptual_criterion
-                    if uses_weighted_reconstruction_loss(args.arch) and loss_weights["perceptual"] > 0.0
+                    if uses_weighted_reconstruction_loss(args) and loss_weights["perceptual"] > 0.0
                     else None
                 ),
             )
@@ -1092,8 +1289,8 @@ def main():
                 local_weight=args.best_metric_local_weight,
             )
 
-            lr = optimizer.param_groups[0]["lr"]
-            if scheduler is not None:
+            lr = epoch_start_lr
+            if scheduler is not None and scheduler_step_mode == "epoch":
                 scheduler.step()
             lr_next = optimizer.param_groups[0]["lr"]
             epoch_time = time.time() - epoch_start_time
@@ -1172,10 +1369,15 @@ def main():
                 )
 
                 logger.info(f"[Epoch {epoch}/{args.epochs}]")
-                if uses_weighted_reconstruction_loss(args.arch):
+                if uses_weighted_reconstruction_loss(args):
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  train_perceptual: {train_perceptual:.4f}"
+                    )
+                elif uses_predrnnpp_openstl_recipe(args):
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                        f"train_mse: {train_mse:.4f}  recipe: {args.predrnnpp_recipe}"
                     )
                 else:
                     logger.info(
