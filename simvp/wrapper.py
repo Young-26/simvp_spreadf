@@ -4,9 +4,10 @@ from typing import Tuple
 from .convlstm_model import ConvLSTM_Model
 from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
+from .predrnnpp_model import PredRNNpp_Model
 
 
-SUPPORTED_ARCHS = ("simvp", "hybrid_unet_facts", "convlstm")
+SUPPORTED_ARCHS = ("simvp", "hybrid_unet_facts", "convlstm", "predrnnpp")
 
 
 class SimVPForecast(nn.Module):
@@ -26,6 +27,11 @@ class SimVPForecast(nn.Module):
         convlstm_patch_size: int = 4,
         convlstm_stride: int = 1,
         convlstm_layer_norm: bool = False,
+        predrnnpp_hidden: str = "128,128,128,128",
+        predrnnpp_filter_size: int = 5,
+        predrnnpp_patch_size: int = 4,
+        predrnnpp_stride: int = 1,
+        predrnnpp_layer_norm: bool = False,
         arch: str = "simvp",
         hybrid_depth: int = 2,
         hybrid_heads: int = 8,
@@ -66,6 +72,22 @@ class SimVPForecast(nn.Module):
                 patch_size=convlstm_patch_size,
                 stride=convlstm_stride,
                 layer_norm=convlstm_layer_norm,
+            )
+        elif self.arch == "predrnnpp":
+            if predrnnpp_stride != 1:
+                raise ValueError(
+                    "PredRNN++ in simvp_spreadf only supports predrnnpp_stride=1. "
+                    "stride>1 is not wired through the hidden/memory spatial shapes, LayerNorm, "
+                    "or output reconstruction path."
+                )
+            self.backbone = PredRNNpp_Model(
+                shape_in=(in_T, C, H, W),
+                out_T=out_T,
+                num_hidden=predrnnpp_hidden,
+                filter_size=predrnnpp_filter_size,
+                patch_size=predrnnpp_patch_size,
+                stride=predrnnpp_stride,
+                layer_norm=predrnnpp_layer_norm,
             )
         elif self.arch == "hybrid_unet_facts":
             self.backbone = HybridUNetFacTS(

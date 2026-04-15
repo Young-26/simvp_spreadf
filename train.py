@@ -23,6 +23,13 @@ from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
 
 
+WEIGHTED_RECONSTRUCTION_ARCHS = {"convlstm", "predrnnpp"}
+
+
+def uses_weighted_reconstruction_loss(arch: str) -> bool:
+    return str(arch).lower() in WEIGHTED_RECONSTRUCTION_ARCHS
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -49,6 +56,11 @@ def parse_args():
     parser.add_argument("--convlstm_patch_size", type=int, default=4)
     parser.add_argument("--convlstm_stride", type=int, default=1)
     parser.add_argument("--convlstm_layer_norm", action="store_true")
+    parser.add_argument("--predrnnpp_hidden", type=str, default="128,128,128,128")
+    parser.add_argument("--predrnnpp_filter_size", type=int, default=5)
+    parser.add_argument("--predrnnpp_patch_size", type=int, default=4)
+    parser.add_argument("--predrnnpp_stride", type=int, default=1)
+    parser.add_argument("--predrnnpp_layer_norm", action="store_true")
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
@@ -251,19 +263,19 @@ class VGGPerceptualLoss(nn.Module):
 
 def resolve_best_metric_mode(args):
     if args.best_metric_mode == "auto":
-        return "clarity" if args.arch == "convlstm" else "combined"
+        return "clarity" if uses_weighted_reconstruction_loss(args.arch) else "combined"
     return args.best_metric_mode
 
 
 def resolve_scheduler_config(args):
     if args.sched == "auto":
-        args.sched = "cosine" if args.arch == "convlstm" else "none"
-    if args.arch == "convlstm":
+        args.sched = "cosine" if uses_weighted_reconstruction_loss(args.arch) else "none"
+    if uses_weighted_reconstruction_loss(args.arch):
         args.warmup_epoch = 0
     return args
 
 
-def resolve_convlstm_loss_weights(args, perceptual_criterion, logger=None):
+def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, logger=None):
     weights = {
         "mae": float(args.loss_mae_weight),
         "mse": float(args.loss_mse_weight),
@@ -271,9 +283,11 @@ def resolve_convlstm_loss_weights(args, perceptual_criterion, logger=None):
     }
     for name, value in weights.items():
         if value < 0:
-            raise ValueError(f"ConvLSTM loss weight '{name}' must be non-negative, but got {value}.")
+            raise ValueError(
+                f"Weighted reconstruction loss weight '{name}' must be non-negative, but got {value}."
+            )
 
-    if args.arch != "convlstm":
+    if not uses_weighted_reconstruction_loss(args.arch):
         weights["perceptual"] = 0.0
         return weights
 
@@ -282,12 +296,14 @@ def resolve_convlstm_loss_weights(args, perceptual_criterion, logger=None):
         if not has_valid_vgg and args.disable_perceptual_when_untrained_vgg:
             if logger is not None:
                 logger.warning(
-                    "Disabling ConvLSTM perceptual loss because no pretrained VGG16 weights were loaded."
+                    f"Disabling {args.arch} perceptual loss because no pretrained VGG16 weights were loaded."
                 )
             weights["perceptual"] = 0.0
 
     if weights["mae"] == 0.0 and weights["mse"] == 0.0 and weights["perceptual"] == 0.0:
-        raise ValueError("ConvLSTM loss weights are all zero; at least one loss term must be enabled.")
+        raise ValueError(
+            f"{args.arch} loss weights are all zero; at least one loss term must be enabled."
+        )
 
     return weights
 
@@ -714,7 +730,7 @@ def main():
     args = resolve_scheduler_config(args)
     args.best_metric_mode = resolve_best_metric_mode(args)
     args.train_loss_mode = (
-        "weighted_reconstruction" if args.arch == "convlstm"
+        "weighted_reconstruction" if uses_weighted_reconstruction_loss(args.arch)
         else "lambda_global*global_l1 + lambda_local*local_l1"
     )
 
@@ -776,6 +792,14 @@ def main():
                 f"patch_size: {args.convlstm_patch_size}  "
                 f"stride: {args.convlstm_stride}  "
                 f"layer_norm: {args.convlstm_layer_norm}"
+            )
+        if args.arch == "predrnnpp":
+            logger.info(
+                f"predrnnpp_hidden: {args.predrnnpp_hidden}  "
+                f"filter_size: {args.predrnnpp_filter_size}  "
+                f"patch_size: {args.predrnnpp_patch_size}  "
+                f"stride: {args.predrnnpp_stride}  "
+                f"layer_norm: {args.predrnnpp_layer_norm}"
             )
 
     # Local targets are always kept available because local metrics and best-model
@@ -857,6 +881,11 @@ def main():
         convlstm_patch_size=args.convlstm_patch_size,
         convlstm_stride=args.convlstm_stride,
         convlstm_layer_norm=args.convlstm_layer_norm,
+        predrnnpp_hidden=args.predrnnpp_hidden,
+        predrnnpp_filter_size=args.predrnnpp_filter_size,
+        predrnnpp_patch_size=args.predrnnpp_patch_size,
+        predrnnpp_stride=args.predrnnpp_stride,
+        predrnnpp_layer_norm=args.predrnnpp_layer_norm,
         arch=args.arch,
         hybrid_depth=args.hybrid_depth,
         hybrid_heads=args.hybrid_heads,
@@ -879,7 +908,7 @@ def main():
     mae_criterion = nn.L1Loss()
     mse_criterion = nn.MSELoss()
     perceptual_criterion = None
-    if args.arch == "convlstm":
+    if uses_weighted_reconstruction_loss(args.arch):
         perceptual_criterion = VGGPerceptualLoss(
             local_weights_path=args.perceptual_vgg_weights,
         ).to(device)
@@ -887,13 +916,13 @@ def main():
         if is_main_process():
             if perceptual_criterion.weight_source == "random":
                 logger.warning(
-                    "ConvLSTM perceptual loss backend: VGG16 random weights."
+                    f"{args.arch} perceptual loss backend: VGG16 random weights."
                 )
             else:
                 logger.info(
-                    f"ConvLSTM perceptual loss backend: VGG16 ({perceptual_criterion.weight_source} weights)"
+                    f"{args.arch} perceptual loss backend: VGG16 ({perceptual_criterion.weight_source} weights)"
                 )
-    loss_weights = resolve_convlstm_loss_weights(
+    loss_weights = resolve_weighted_reconstruction_loss_weights(
         args=args,
         perceptual_criterion=perceptual_criterion,
         logger=logger if is_main_process() else None,
@@ -901,7 +930,7 @@ def main():
     args.loss_mae_weight_effective = loss_weights["mae"]
     args.loss_mse_weight_effective = loss_weights["mse"]
     args.loss_percep_weight_effective = loss_weights["perceptual"]
-    if args.arch == "convlstm":
+    if uses_weighted_reconstruction_loss(args.arch):
         args.train_loss_mode = (
             f"{loss_weights['mae']:.4f}*MAE + "
             f"{loss_weights['mse']:.4f}*MSE + "
@@ -963,7 +992,7 @@ def main():
                     pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
                     loss_mae = mae_criterion(pred, y)
                     loss_mse = mse_criterion(pred, y)
-                    if args.arch == "convlstm":
+                    if uses_weighted_reconstruction_loss(args.arch):
                         loss_local = pred.new_zeros(())
                     else:
                         if y_local is not None:
@@ -973,7 +1002,7 @@ def main():
                             loss_local = pred.new_zeros(())
                         loss = args.lambda_global * loss_mae + args.lambda_local * loss_local
 
-                if args.arch == "convlstm":
+                if uses_weighted_reconstruction_loss(args.arch):
                     if loss_weights["perceptual"] > 0.0:
                         loss_perceptual = perceptual_criterion(pred.float(), y.float())
                     else:
@@ -996,12 +1025,12 @@ def main():
                 train_mse_sum += loss_mse.item() * bs
                 train_perceptual_sum += loss_perceptual.item() * bs
                 train_count += bs
-                if args.arch != "convlstm" and y_local is not None:
+                if not uses_weighted_reconstruction_loss(args.arch) and y_local is not None:
                     train_loss_local_sum += loss_local.item() * bs
                     train_local_count += bs
 
                 if is_main_process():
-                    if args.arch == "convlstm":
+                    if uses_weighted_reconstruction_loss(args.arch):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mae=f"{loss_mae.item():.6f}",
@@ -1040,7 +1069,7 @@ def main():
                 strict_local=args.use_local_branch,
                 perceptual_criterion=(
                     perceptual_criterion
-                    if args.arch == "convlstm" and loss_weights["perceptual"] > 0.0
+                    if uses_weighted_reconstruction_loss(args.arch) and loss_weights["perceptual"] > 0.0
                     else None
                 ),
             )
@@ -1143,7 +1172,7 @@ def main():
                 )
 
                 logger.info(f"[Epoch {epoch}/{args.epochs}]")
-                if args.arch == "convlstm":
+                if uses_weighted_reconstruction_loss(args.arch):
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  train_perceptual: {train_perceptual:.4f}"
