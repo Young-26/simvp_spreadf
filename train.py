@@ -19,6 +19,7 @@ from tqdm import tqdm
 from torchvision.models import VGG16_Weights, vgg16
 
 from datasets.ionogram_manifest import IonogramManifestDataset
+from simvp.tau_model import tau_diff_div_reg
 from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
 
@@ -37,6 +38,10 @@ def is_predrnnpp_arch(args) -> bool:
     return str(args.arch).lower() == "predrnnpp"
 
 
+def is_tau_arch(args) -> bool:
+    return str(args.arch).lower() == "tau"
+
+
 def uses_predrnnpp_openstl_recipe(args) -> bool:
     return is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "openstl"
 
@@ -47,7 +52,17 @@ def uses_weighted_reconstruction_loss(args) -> bool:
 
 
 def uses_local_reconstruction_loss(args) -> bool:
-    return not uses_weighted_reconstruction_loss(args) and not uses_predrnnpp_openstl_recipe(args)
+    return (
+        not uses_weighted_reconstruction_loss(args)
+        and not uses_predrnnpp_openstl_recipe(args)
+        and not is_tau_arch(args)
+    )
+
+
+def should_enable_ddp_find_unused_parameters(args) -> bool:
+    # OpenSTL's PredRNN++ reference cell registers conv_o but does not consume it in forward().
+    # DDP therefore needs unused-parameter detection for PredRNN++ training on multiple GPUs.
+    return is_predrnnpp_arch(args)
 
 
 def resolve_recipe_tag(args) -> str:
@@ -100,6 +115,12 @@ def parse_args():
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
+    parser.add_argument("--tau_spatio_kernel_enc", type=int, default=3)
+    parser.add_argument("--tau_spatio_kernel_dec", type=int, default=3)
+    parser.add_argument("--tau_mlp_ratio", type=float, default=8.0)
+    parser.add_argument("--tau_drop", type=float, default=0.0)
+    parser.add_argument("--tau_drop_path", type=float, default=0.0)
+    parser.add_argument("--tau_alpha", type=float, default=0.1)
     parser.add_argument("--hybrid_depth", type=int, default=2)
     parser.add_argument("--hybrid_heads", type=int, default=8)
     parser.add_argument("--hybrid_ffn_ratio", type=float, default=4.0)
@@ -371,7 +392,7 @@ def resolve_optimizer_config(args):
     args.predrnnpp_recipe = get_predrnnpp_recipe(args)
     opt = str(args.opt).lower()
     if opt == "auto":
-        opt = "adam" if uses_predrnnpp_openstl_recipe(args) else "adamw"
+        opt = "adam" if uses_predrnnpp_openstl_recipe(args) or is_tau_arch(args) else "adamw"
     args.opt = opt
     return args
 
@@ -381,11 +402,13 @@ def resolve_scheduler_config(args):
     if args.sched == "auto":
         if uses_predrnnpp_openstl_recipe(args):
             args.sched = "onecycle"
+        elif is_tau_arch(args):
+            args.sched = "cosine"
         elif uses_weighted_reconstruction_loss(args):
             args.sched = "cosine"
         else:
             args.sched = "none"
-    if uses_weighted_reconstruction_loss(args) or uses_predrnnpp_openstl_recipe(args):
+    if uses_weighted_reconstruction_loss(args) or uses_predrnnpp_openstl_recipe(args) or is_tau_arch(args):
         args.warmup_epoch = 0
     return args
 
@@ -426,6 +449,10 @@ def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, log
 def resolve_train_loss_mode(args, loss_weights=None):
     if uses_predrnnpp_openstl_recipe(args):
         return "mse_openstl"
+    if is_tau_arch(args):
+        if int(args.out_T) <= 2:
+            return f"mse + {float(args.tau_alpha):.4f}*diff_div(inactive_when_out_T<=2)"
+        return f"mse + {float(args.tau_alpha):.4f}*diff_div"
     if uses_weighted_reconstruction_loss(args):
         if loss_weights is None:
             return "weighted_reconstruction"
@@ -942,6 +969,20 @@ def main():
         )
         logger.info(f"report_local_metrics: {args.report_local_metrics}")
         logger.info(f"best_metric_local_weight: {args.best_metric_local_weight}")
+        if is_tau_arch(args):
+            logger.info(
+                f"tau_spatio_kernel_enc: {args.tau_spatio_kernel_enc}  "
+                f"tau_spatio_kernel_dec: {args.tau_spatio_kernel_dec}  "
+                f"tau_mlp_ratio: {args.tau_mlp_ratio}  "
+                f"tau_drop: {args.tau_drop}  "
+                f"tau_drop_path: {args.tau_drop_path}  "
+                f"tau_alpha: {args.tau_alpha}"
+            )
+            if args.out_T <= 2:
+                logger.warning(
+                    "TAU diff_div_reg is inactive when out_T<=2. Under the current dataset setting, "
+                    "the TAU training loss reduces to plain MSE."
+                )
         if args.arch == "hybrid_unet_facts":
             logger.info(
                 "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
@@ -1042,6 +1083,11 @@ def main():
         hid_T=args.hid_T,
         N_S=args.N_S,
         N_T=args.N_T,
+        tau_spatio_kernel_enc=args.tau_spatio_kernel_enc,
+        tau_spatio_kernel_dec=args.tau_spatio_kernel_dec,
+        tau_mlp_ratio=args.tau_mlp_ratio,
+        tau_drop=args.tau_drop,
+        tau_drop_path=args.tau_drop_path,
         convlstm_hidden=args.convlstm_hidden,
         convlstm_filter_size=args.convlstm_filter_size,
         convlstm_patch_size=args.convlstm_patch_size,
@@ -1065,12 +1111,13 @@ def main():
         local_crop=(args.local_top, args.local_bottom),
     ).to(device)
 
+    ddp_find_unused_parameters = should_enable_ddp_find_unused_parameters(args)
     if use_ddp:
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,
+            find_unused_parameters=ddp_find_unused_parameters,
         )
 
     mae_criterion = nn.L1Loss()
@@ -1109,6 +1156,7 @@ def main():
     optimizer = build_optimizer(args, model)
     scheduler, scheduler_step_mode = build_lr_scheduler(args, optimizer, steps_per_epoch=len(train_loader))
     if is_main_process():
+        logger.info(f"ddp_find_unused_parameters: {ddp_find_unused_parameters}")
         logger.info(f"optimizer_impl: {type(optimizer).__name__}")
         logger.info(f"scheduler_impl: {type(scheduler).__name__ if scheduler is not None else 'None'}")
     scaler = create_grad_scaler(device.type, amp_enabled)
@@ -1141,6 +1189,7 @@ def main():
             train_loss_local_sum = 0.0
             train_mse_sum = 0.0
             train_perceptual_sum = 0.0
+            train_diff_div_sum = 0.0
             train_count = 0.0
             train_local_count = 0.0
 
@@ -1195,13 +1244,22 @@ def main():
                         loss_perceptual = perceptual_criterion(pred.float(), y.float())
                     else:
                         loss_perceptual = pred.new_zeros(())
+                    loss_diff_div = pred.new_zeros(())
                     loss = (
                         loss_weights["mae"] * loss_mae
                         + loss_weights["mse"] * loss_mse
                         + loss_weights["perceptual"] * loss_perceptual
                     )
+                elif is_tau_arch(args):
+                    loss_perceptual = pred.new_zeros(())
+                    loss_diff_div = tau_diff_div_reg(
+                        pred.float(),
+                        y.float(),
+                    )
+                    loss = loss_mse + float(args.tau_alpha) * loss_diff_div
                 else:
                     loss_perceptual = pred.new_zeros(())
+                    loss_diff_div = pred.new_zeros(())
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -1215,6 +1273,7 @@ def main():
                 train_loss_global_sum += loss_mae.item() * bs
                 train_mse_sum += loss_mse.item() * bs
                 train_perceptual_sum += loss_perceptual.item() * bs
+                train_diff_div_sum += loss_diff_div.item() * bs
                 train_count += bs
                 if uses_local_reconstruction_loss(args) and y_local is not None:
                     train_loss_local_sum += loss_local.item() * bs
@@ -1234,6 +1293,12 @@ def main():
                             mae=f"{loss_mae.item():.6f}",
                             mse=f"{loss_mse.item():.6f}",
                         )
+                    elif is_tau_arch(args):
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
+                            diff_div=f"{loss_diff_div.item():.6f}",
+                        )
                     else:
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
@@ -1246,6 +1311,7 @@ def main():
             train_loss_local_sum = reduce_sum_scalar(train_loss_local_sum, device)
             train_mse_sum = reduce_sum_scalar(train_mse_sum, device)
             train_perceptual_sum = reduce_sum_scalar(train_perceptual_sum, device)
+            train_diff_div_sum = reduce_sum_scalar(train_diff_div_sum, device)
             train_count = reduce_sum_scalar(train_count, device)
             train_local_count = reduce_sum_scalar(train_local_count, device)
             train_loss = train_loss_sum / max(train_count, 1.0)
@@ -1253,6 +1319,7 @@ def main():
             train_loss_local = train_loss_local_sum / max(train_local_count, 1.0)
             train_mse = train_mse_sum / max(train_count, 1.0)
             train_perceptual = train_perceptual_sum / max(train_count, 1.0)
+            train_diff_div = train_diff_div_sum / max(train_count, 1.0)
             train_mae = train_loss_global
 
             val_metrics = evaluate(
@@ -1378,6 +1445,11 @@ def main():
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  recipe: {args.predrnnpp_recipe}"
+                    )
+                elif is_tau_arch(args):
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
+                        f"train_diff_div: {train_diff_div:.4f}  tau_alpha: {args.tau_alpha:.4f}"
                     )
                 else:
                     logger.info(

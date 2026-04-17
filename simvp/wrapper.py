@@ -5,9 +5,10 @@ from .convlstm_model import ConvLSTM_Model
 from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
 from .predrnnpp_model import PredRNNpp_Model
+from .tau_model import TAU_Model
 
 
-SUPPORTED_ARCHS = ("simvp", "hybrid_unet_facts", "convlstm", "predrnnpp")
+SUPPORTED_ARCHS = ("simvp", "tau", "hybrid_unet_facts", "convlstm", "predrnnpp")
 
 
 class SimVPForecast(nn.Module):
@@ -43,6 +44,11 @@ class SimVPForecast(nn.Module):
         hybrid_drop_path: float = 0.1,
         use_local_branch: bool = False,
         local_crop: Tuple[int, int] = (186, 410),
+        tau_spatio_kernel_enc: int = 3,
+        tau_spatio_kernel_dec: int = 3,
+        tau_mlp_ratio: float = 8.0,
+        tau_drop: float = 0.0,
+        tau_drop_path: float = 0.0,
     ):
         super().__init__()
         self.arch = arch.lower()
@@ -63,6 +69,19 @@ class SimVPForecast(nn.Module):
                 hid_T=hid_T,
                 N_S=N_S,
                 N_T=N_T,
+            )
+        elif self.arch == "tau":
+            self.backbone = TAU_Model(
+                shape_in=(in_T, C, H, W),
+                hid_S=hid_S,
+                hid_T=hid_T,
+                N_S=N_S,
+                N_T=N_T,
+                spatio_kernel_enc=tau_spatio_kernel_enc,
+                spatio_kernel_dec=tau_spatio_kernel_dec,
+                mlp_ratio=tau_mlp_ratio,
+                drop=tau_drop,
+                drop_path=tau_drop_path,
             )
         elif self.arch == "convlstm":
             if convlstm_stride != 1:
@@ -145,7 +164,7 @@ class SimVPForecast(nn.Module):
             )
         else:
             y = self.backbone(x)
-        if self.arch == "simvp":
+        if self.arch in ("simvp", "tau"):
             y = y[:, :self.out_T]
             return y
         if self.arch == "predrnnpp":

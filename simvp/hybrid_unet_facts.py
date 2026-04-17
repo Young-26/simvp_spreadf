@@ -728,63 +728,42 @@ class LocalResidualRefiner(nn.Module):
             dropout=dropout,
         )
 
-        self.coarse_encoder = nn.Sequential(
-            ConvNormAct(in_channels, hidden_dim, kernel_size=3, stride=1),
-            ResidualConvBlock(hidden_dim, hidden_dim),
-        )
-
-        fusion_blocks: List[nn.Module] = [ResidualConvBlock(hidden_dim * 2, hidden_dim)]
-        fusion_blocks.extend(
+        future_blocks: List[nn.Module] = [ResidualConvBlock(hidden_dim, hidden_dim)]
+        future_blocks.extend(
             ResidualConvBlock(hidden_dim, hidden_dim)
             for _ in range(num_blocks - 1)
         )
-        self.fusion = nn.Sequential(*fusion_blocks)
+        self.future_decoder = nn.Sequential(*future_blocks)
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.readout = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
 
-    def forward(self, x_local: torch.Tensor, pred_local: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_local: torch.Tensor) -> torch.Tensor:
         batch_size, history_frames, channels, local_height, local_width = x_local.shape
-        pred_batch_size, future_frames, pred_channels, pred_height, pred_width = pred_local.shape
 
         if history_frames != self.in_T:
             raise ValueError(f"Expected {self.in_T} local history frames, but got {history_frames}.")
-        if future_frames != self.out_T:
-            raise ValueError(f"Expected {self.out_T} coarse local frames, but got {future_frames}.")
-        if channels != self.in_channels or pred_channels != self.in_channels:
-            raise ValueError(
-                f"Expected {self.in_channels} local channels, but got history={channels}, coarse={pred_channels}."
-            )
-        if batch_size != pred_batch_size:
-            raise ValueError(f"Mismatched batch size between x_local and pred_local: {batch_size} vs {pred_batch_size}.")
-        if (local_height, local_width) != (pred_height, pred_width):
-            raise ValueError(
-                "x_local and pred_local must share the same spatial size, "
-                f"but got {(local_height, local_width)} and {(pred_height, pred_width)}."
-            )
+        if channels != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} local channels, but got {channels}.")
 
         history = self.history_encoder(
             x_local.reshape(batch_size * history_frames, channels, local_height, local_width)
         ).reshape(batch_size, history_frames, self.hidden_dim, local_height, local_width)
         history_future = self.history_forecast_head(history)
 
-        coarse = self.coarse_encoder(
-            pred_local.reshape(batch_size * future_frames, pred_channels, pred_height, pred_width)
-        ).reshape(batch_size, future_frames, self.hidden_dim, pred_height, pred_width)
-
-        fused = torch.cat([history_future, coarse], dim=2).reshape(
-            batch_size * future_frames,
-            self.hidden_dim * 2,
-            pred_height,
-            pred_width,
+        delta_feature = history_future.reshape(
+            batch_size * self.out_T,
+            self.hidden_dim,
+            local_height,
+            local_width,
         )
-        fused = self.fusion(fused)
-        fused = self.dropout(fused)
-        delta_local = self.readout(fused).reshape(
+        delta_feature = self.future_decoder(delta_feature)
+        delta_feature = self.dropout(delta_feature)
+        delta_local = self.readout(delta_feature).reshape(
             batch_size,
-            future_frames,
+            self.out_T,
             self.in_channels,
-            pred_height,
-            pred_width,
+            local_height,
+            local_width,
         )
         return delta_local
 
@@ -973,7 +952,7 @@ class HybridUNetFacTS(nn.Module):
         if self.local_refiner is not None and x_local is not None:
             # Refine only the fixed F-region in image space and write it back to the global prediction.
             coarse_local = self._crop_local_region(global_pred)
-            delta_local = self.local_refiner(x_local, coarse_local)
+            delta_local = self.local_refiner(x_local)
             delta_local = torch.tanh(delta_local)
             refined_local = coarse_local + self.local_residual_scale * delta_local
             final_pred = self._write_local_region(global_pred, refined_local)
