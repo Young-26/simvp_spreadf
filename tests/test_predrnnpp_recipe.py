@@ -9,6 +9,43 @@ from simvp.predrnnpp_model import GHU, PredRNNpp_Model
 from simvp.wrapper import SimVPForecast
 
 
+class _StepCounterOptimizer:
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self):
+        self.step_calls += 1
+
+
+class _StepCounterScheduler:
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self):
+        self.step_calls += 1
+
+
+class _FakeScaler:
+    def __init__(self, old_scale: float, new_scale: float, execute_optimizer_step: bool):
+        self._scale = float(old_scale)
+        self._new_scale = float(new_scale)
+        self.execute_optimizer_step = bool(execute_optimizer_step)
+        self.step_calls = 0
+        self.update_calls = 0
+
+    def step(self, optimizer):
+        self.step_calls += 1
+        if self.execute_optimizer_step:
+            optimizer.step()
+
+    def update(self):
+        self.update_calls += 1
+        self._scale = self._new_scale
+
+    def get_scale(self):
+        return self._scale
+
+
 class PredRNNppRecipeTests(unittest.TestCase):
     def test_ghu_smoke_without_layer_norm(self):
         ghu = GHU(
@@ -139,6 +176,82 @@ class PredRNNppRecipeTests(unittest.TestCase):
             loss.backward()
             optimizer.step()
             scheduler.step()
+
+    def test_iter_scheduler_steps_after_non_amp_optimizer_step(self):
+        optimizer = _StepCounterOptimizer()
+        scheduler = _StepCounterScheduler()
+        scaler = _FakeScaler(old_scale=1.0, new_scale=1.0, execute_optimizer_step=True)
+
+        optimizer_step_executed = train_lib.step_optimizer_and_maybe_step_scheduler(
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+            scheduler_step_mode="iter",
+            amp_enabled=False,
+        )
+
+        self.assertTrue(optimizer_step_executed)
+        self.assertEqual(optimizer.step_calls, 1)
+        self.assertEqual(scheduler.step_calls, 1)
+        self.assertEqual(scaler.step_calls, 0)
+        self.assertEqual(scaler.update_calls, 0)
+
+    def test_iter_scheduler_does_not_advance_when_amp_skips_step(self):
+        optimizer = _StepCounterOptimizer()
+        scheduler = _StepCounterScheduler()
+        scaler = _FakeScaler(old_scale=65536.0, new_scale=32768.0, execute_optimizer_step=False)
+
+        optimizer_step_executed = train_lib.step_optimizer_and_maybe_step_scheduler(
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+            scheduler_step_mode="iter",
+            amp_enabled=True,
+        )
+
+        self.assertFalse(optimizer_step_executed)
+        self.assertEqual(optimizer.step_calls, 0)
+        self.assertEqual(scheduler.step_calls, 0)
+        self.assertEqual(scaler.step_calls, 1)
+        self.assertEqual(scaler.update_calls, 1)
+
+    def test_iter_scheduler_advances_when_amp_step_is_valid(self):
+        optimizer = _StepCounterOptimizer()
+        scheduler = _StepCounterScheduler()
+        scaler = _FakeScaler(old_scale=65536.0, new_scale=65536.0, execute_optimizer_step=True)
+
+        optimizer_step_executed = train_lib.step_optimizer_and_maybe_step_scheduler(
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+            scheduler_step_mode="iter",
+            amp_enabled=True,
+        )
+
+        self.assertTrue(optimizer_step_executed)
+        self.assertEqual(optimizer.step_calls, 1)
+        self.assertEqual(scheduler.step_calls, 1)
+        self.assertEqual(scaler.step_calls, 1)
+        self.assertEqual(scaler.update_calls, 1)
+
+    def test_epoch_scheduler_is_not_advanced_inside_train_step_helper(self):
+        optimizer = _StepCounterOptimizer()
+        scheduler = _StepCounterScheduler()
+        scaler = _FakeScaler(old_scale=65536.0, new_scale=65536.0, execute_optimizer_step=True)
+
+        optimizer_step_executed = train_lib.step_optimizer_and_maybe_step_scheduler(
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+            scheduler_step_mode="epoch",
+            amp_enabled=True,
+        )
+
+        self.assertTrue(optimizer_step_executed)
+        self.assertEqual(optimizer.step_calls, 1)
+        self.assertEqual(scheduler.step_calls, 0)
+        self.assertEqual(scaler.step_calls, 1)
+        self.assertEqual(scaler.update_calls, 1)
 
     def test_real_input_flag_shapes(self):
         args = Namespace(

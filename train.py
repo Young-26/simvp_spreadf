@@ -306,6 +306,9 @@ def create_grad_scaler(device_type: str, enabled: bool):
         def update(self):
             return None
 
+        def get_scale(self):
+            return 1.0
+
         def state_dict(self):
             return {}
 
@@ -313,6 +316,32 @@ def create_grad_scaler(device_type: str, enabled: bool):
             return None
 
     return _IdentityScaler()
+
+
+def step_optimizer_and_maybe_step_scheduler(
+    optimizer,
+    scaler,
+    scheduler,
+    scheduler_step_mode: str,
+    amp_enabled: bool,
+):
+    optimizer_step_executed = True
+
+    if amp_enabled:
+        old_scale = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        new_scale = scaler.get_scale()
+        # GradScaler lowers the scale when inf/NaN gradients force the optimizer step to be skipped.
+        optimizer_step_executed = new_scale >= old_scale
+    else:
+        optimizer.step()
+
+    # Iter-level schedulers such as OneCycleLR must only advance after a real optimizer update.
+    if scheduler is not None and scheduler_step_mode == "iter" and optimizer_step_executed:
+        scheduler.step()
+
+    return optimizer_step_executed
 
 
 class VGGPerceptualLoss(nn.Module):
@@ -1262,10 +1291,15 @@ def main():
                     loss_diff_div = pred.new_zeros(())
 
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                if scheduler is not None and scheduler_step_mode == "iter":
-                    scheduler.step()
+                # Keep the optimizer/scaler update ahead of the iter-level scheduler update.
+                # Under AMP, skip advancing OneCycleLR when GradScaler suppresses the optimizer step.
+                step_optimizer_and_maybe_step_scheduler(
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    scheduler=scheduler,
+                    scheduler_step_mode=scheduler_step_mode,
+                    amp_enabled=amp_enabled,
+                )
                 global_step += 1
 
                 bs = x.size(0)
