@@ -489,6 +489,7 @@ def build_model_from_ckpt_args(
     in_T = int(ckpt_args.get("in_T", 8))
     out_T = int(ckpt_args.get("out_T", 2))
     arch = str(ckpt_args.get("arch", "simvp"))
+    simvp_model_type = str(ckpt_args.get("simvp_model_type", "incepu"))
     predrnnpp_recipe = str(ckpt_args.get("predrnnpp_recipe", "simvp"))
     use_local_branch = bool(ckpt_args.get("use_local_branch", False))
     local_top = int(ckpt_args.get("local_top", 186))
@@ -505,6 +506,12 @@ def build_model_from_ckpt_args(
         hid_T=int(ckpt_args.get("hid_T", 128)),
         N_S=int(ckpt_args.get("N_S", 4)),
         N_T=int(ckpt_args.get("N_T", 4)),
+        simvp_model_type=simvp_model_type,
+        simvp_spatio_kernel_enc=int(ckpt_args.get("simvp_spatio_kernel_enc", 3)),
+        simvp_spatio_kernel_dec=int(ckpt_args.get("simvp_spatio_kernel_dec", 3)),
+        simvp_mlp_ratio=float(ckpt_args.get("simvp_mlp_ratio", 8.0)),
+        simvp_drop=float(ckpt_args.get("simvp_drop", 0.0)),
+        simvp_drop_path=float(ckpt_args.get("simvp_drop_path", 0.0)),
         tau_spatio_kernel_enc=int(ckpt_args.get("tau_spatio_kernel_enc", 3)),
         tau_spatio_kernel_dec=int(ckpt_args.get("tau_spatio_kernel_dec", 3)),
         tau_mlp_ratio=float(ckpt_args.get("tau_mlp_ratio", 8.0)),
@@ -536,6 +543,7 @@ def build_model_from_ckpt_args(
         "in_T": in_T,
         "out_T": out_T,
         "arch": arch,
+        "simvp_model_type": simvp_model_type,
         "predrnnpp_recipe": predrnnpp_recipe,
         "use_local_branch": use_local_branch,
         "local_crop": local_crop,

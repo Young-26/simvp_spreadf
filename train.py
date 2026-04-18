@@ -25,6 +25,7 @@ from utils.seed import set_seed
 
 
 PREDRNNPP_RECIPES = ("simvp", "openstl")
+SIMVP_MODEL_TYPES = ("incepu", "gsta")
 
 
 def get_predrnnpp_recipe(args) -> str:
@@ -90,6 +91,12 @@ def parse_args():
     parser.add_argument("--hid_T", type=int, default=128)
     parser.add_argument("--N_S", type=int, default=4)
     parser.add_argument("--N_T", type=int, default=4)
+    parser.add_argument("--simvp_model_type", type=str, default="incepu", choices=SIMVP_MODEL_TYPES)
+    parser.add_argument("--simvp_spatio_kernel_enc", type=int, default=3)
+    parser.add_argument("--simvp_spatio_kernel_dec", type=int, default=3)
+    parser.add_argument("--simvp_mlp_ratio", type=float, default=8.0)
+    parser.add_argument("--simvp_drop", type=float, default=0.0)
+    parser.add_argument("--simvp_drop_path", type=float, default=0.0)
     parser.add_argument("--convlstm_hidden", type=str, default="128,128,128,128")
     parser.add_argument("--convlstm_filter_size", type=int, default=5)
     parser.add_argument("--convlstm_patch_size", type=int, default=4)
@@ -998,6 +1005,16 @@ def main():
         )
         logger.info(f"report_local_metrics: {args.report_local_metrics}")
         logger.info(f"best_metric_local_weight: {args.best_metric_local_weight}")
+        if args.arch == "simvp":
+            logger.info(f"simvp_model_type: {args.simvp_model_type}")
+            if str(args.simvp_model_type).lower() == "gsta":
+                logger.info(
+                    f"simvp_spatio_kernel_enc: {args.simvp_spatio_kernel_enc}  "
+                    f"simvp_spatio_kernel_dec: {args.simvp_spatio_kernel_dec}  "
+                    f"simvp_mlp_ratio: {args.simvp_mlp_ratio}  "
+                    f"simvp_drop: {args.simvp_drop}  "
+                    f"simvp_drop_path: {args.simvp_drop_path}"
+                )
         if is_tau_arch(args):
             logger.info(
                 f"tau_spatio_kernel_enc: {args.tau_spatio_kernel_enc}  "
@@ -1112,6 +1129,12 @@ def main():
         hid_T=args.hid_T,
         N_S=args.N_S,
         N_T=args.N_T,
+        simvp_model_type=args.simvp_model_type,
+        simvp_spatio_kernel_enc=args.simvp_spatio_kernel_enc,
+        simvp_spatio_kernel_dec=args.simvp_spatio_kernel_dec,
+        simvp_mlp_ratio=args.simvp_mlp_ratio,
+        simvp_drop=args.simvp_drop,
+        simvp_drop_path=args.simvp_drop_path,
         tau_spatio_kernel_enc=args.tau_spatio_kernel_enc,
         tau_spatio_kernel_dec=args.tau_spatio_kernel_dec,
         tau_mlp_ratio=args.tau_mlp_ratio,

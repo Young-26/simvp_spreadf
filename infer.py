@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("--in_T", type=int, default=None)
     parser.add_argument("--out_T", type=int, default=None)
     parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
+    parser.add_argument("--simvp_model_type", type=str, default=None, choices=["incepu", "gsta"])
     parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=["simvp", "openstl"])
     parser.add_argument("--use_local_branch", action="store_true", default=None)
     parser.add_argument("--local_top", type=int, default=None)
@@ -195,6 +196,7 @@ def main():
     in_T = resolve_saved_first(saved_args, "in_T", args.in_T, 8)
     out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
     arch = resolve_override(args.arch, saved_args, "arch", "simvp")
+    simvp_model_type = resolve_override(args.simvp_model_type, saved_args, "simvp_model_type", "incepu")
     predrnnpp_recipe = resolve_override(args.predrnnpp_recipe, saved_args, "predrnnpp_recipe", "simvp")
     use_local_branch = resolve_override(args.use_local_branch, saved_args, "use_local_branch", False)
     local_top = resolve_saved_first(saved_args, "local_top", args.local_top, 186)
@@ -217,6 +219,12 @@ def main():
         hid_T=saved_args.get("hid_T", 128),
         N_S=saved_args.get("N_S", 4),
         N_T=saved_args.get("N_T", 4),
+        simvp_model_type=simvp_model_type,
+        simvp_spatio_kernel_enc=int(saved_args.get("simvp_spatio_kernel_enc", 3)),
+        simvp_spatio_kernel_dec=int(saved_args.get("simvp_spatio_kernel_dec", 3)),
+        simvp_mlp_ratio=float(saved_args.get("simvp_mlp_ratio", 8.0)),
+        simvp_drop=float(saved_args.get("simvp_drop", 0.0)),
+        simvp_drop_path=float(saved_args.get("simvp_drop_path", 0.0)),
         tau_spatio_kernel_enc=int(saved_args.get("tau_spatio_kernel_enc", 3)),
         tau_spatio_kernel_dec=int(saved_args.get("tau_spatio_kernel_dec", 3)),
         tau_mlp_ratio=float(saved_args.get("tau_mlp_ratio", 8.0)),

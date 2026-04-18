@@ -23,6 +23,12 @@ class SimVPForecast(nn.Module):
         hid_T: int = 128,
         N_S: int = 4,
         N_T: int = 4,
+        simvp_model_type: str = "incepu",
+        simvp_spatio_kernel_enc: int = 3,
+        simvp_spatio_kernel_dec: int = 3,
+        simvp_mlp_ratio: float = 8.0,
+        simvp_drop: float = 0.0,
+        simvp_drop_path: float = 0.0,
         convlstm_hidden: str = "128,128,128,128",
         convlstm_filter_size: int = 5,
         convlstm_patch_size: int = 4,
@@ -54,12 +60,17 @@ class SimVPForecast(nn.Module):
         self.arch = arch.lower()
         self.out_T = out_T
         self.predrnnpp_recipe = str(predrnnpp_recipe).lower()
+        self.simvp_model_type = "incepu" if simvp_model_type is None else str(simvp_model_type).lower()
 
         if use_local_branch and self.arch != "hybrid_unet_facts":
             raise ValueError("The local F-region branch is only supported by 'hybrid_unet_facts'.")
         if self.arch == "predrnnpp" and self.predrnnpp_recipe not in ("simvp", "openstl"):
             raise ValueError(
                 f"Unsupported PredRNN++ recipe '{predrnnpp_recipe}'. Available choices: ('simvp', 'openstl')."
+            )
+        if self.arch == "simvp" and self.simvp_model_type not in ("incepu", "gsta", "v1", "v2", "simvpv1", "simvpv2"):
+            raise ValueError(
+                f"Unsupported SimVP model_type '{simvp_model_type}'. Available choices: ('incepu', 'gsta')."
             )
 
         if self.arch == "simvp":
@@ -69,6 +80,12 @@ class SimVPForecast(nn.Module):
                 hid_T=hid_T,
                 N_S=N_S,
                 N_T=N_T,
+                model_type=self.simvp_model_type,
+                spatio_kernel_enc=simvp_spatio_kernel_enc,
+                spatio_kernel_dec=simvp_spatio_kernel_dec,
+                mlp_ratio=simvp_mlp_ratio,
+                drop=simvp_drop,
+                drop_path=simvp_drop_path,
             )
         elif self.arch == "tau":
             self.backbone = TAU_Model(
