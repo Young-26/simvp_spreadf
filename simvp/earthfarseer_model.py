@@ -24,6 +24,23 @@ def _to_2tuple(value: Union[int, Sequence[int]]) -> Tuple[int, int]:
     return scalar, scalar
 
 
+def _resolve_depth(explicit_depth: Optional[int], legacy_depth: int, *, name: str) -> int:
+    resolved = legacy_depth if explicit_depth is None else explicit_depth
+    resolved = int(resolved)
+    if resolved < 1:
+        raise ValueError(f"EarthFarseer {name} must be >= 1, but got {resolved}.")
+    return resolved
+
+
+def _resolve_group_norm_groups(num_channels: int, max_groups: int) -> int:
+    num_channels = int(num_channels)
+    max_groups = max(1, min(int(max_groups), num_channels))
+    for groups in range(max_groups, 0, -1):
+        if num_channels % groups == 0:
+            return groups
+    return 1
+
+
 class ResidualSkipConnection(nn.Module):
     def __init__(
         self,
@@ -67,14 +84,13 @@ class FourierMlp(nn.Module):
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
-        self.fc3 = nn.AdaptiveAvgPool1d(out_features)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc3(x)
+        x = self.fc2(x)
         x = self.drop(x)
         return x
 
@@ -112,16 +128,21 @@ class AdaptiveFourierNeuralOperator(nn.Module):
         x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
         x = x.reshape(B, x.shape[1], x.shape[2], self.num_blocks, self.block_size)
 
+        old_real = x.real
+        old_imag = x.imag
         x_real = F.relu(
-            self.multiply(x.real, self.w1[0]) - self.multiply(x.imag, self.w1[1]) + self.b1[0],
+            self.multiply(old_real, self.w1[0]) - self.multiply(old_imag, self.w1[1]) + self.b1[0],
             inplace=True,
         )
         x_imag = F.relu(
-            self.multiply(x.real, self.w1[1]) + self.multiply(x.imag, self.w1[0]) + self.b1[1],
+            self.multiply(old_real, self.w1[1]) + self.multiply(old_imag, self.w1[0]) + self.b1[1],
             inplace=True,
         )
-        x_real = self.multiply(x_real, self.w2[0]) - self.multiply(x_imag, self.w2[1]) + self.b2[0]
-        x_imag = self.multiply(x_real, self.w2[1]) + self.multiply(x_imag, self.w2[0]) + self.b2[1]
+        # Keep real/imag updates within the same stage on the same snapshot to avoid order-dependent pollution.
+        old_real = x_real
+        old_imag = x_imag
+        x_real = self.multiply(old_real, self.w2[0]) - self.multiply(old_imag, self.w2[1]) + self.b2[0]
+        x_imag = self.multiply(old_real, self.w2[1]) + self.multiply(old_imag, self.w2[0]) + self.b2[1]
 
         x = torch.stack([x_real, x_imag], dim=-1)
         if self.softshrink > 0.0:
@@ -297,21 +318,70 @@ class GlobalFourierBlock(nn.Module):
 
 
 class LocalCNNBranch(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int = 16,
+        num_layers: int = 3,
+        norm_groups: int = 8,
+    ):
         super().__init__()
-        self.upconv = nn.ConvTranspose2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-        )
+        if num_layers < 1:
+            raise ValueError(f"EarthFarseer local branch depth must be >= 1, but got {num_layers}.")
+
+        hidden_channels = max(int(hidden_channels), in_channels, out_channels)
+        stem_groups = _resolve_group_norm_groups(hidden_channels, norm_groups)
+
+        layers = [
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(stem_groups, hidden_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+        ]
+        for _ in range(1, num_layers):
+            layers.extend(
+                [
+                    nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
+                    nn.GroupNorm(stem_groups, hidden_channels),
+                    nn.LeakyReLU(0.2, inplace=True),
+                ]
+            )
+
+        self.body = nn.Sequential(*layers)
+        self.readout = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        if in_channels == out_channels:
+            self.shortcut = nn.Identity()
+        else:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = x.shape
         x = x.reshape(B * T, C, H, W)
-        x = self.upconv(x)
+        residual = self.shortcut(x)
+        x = self.body(x)
+        x = self.readout(x)
+        x = x + residual
         return x.reshape(B, T, x.shape[1], x.shape[2], x.shape[3])
+
+
+class TemporalProjectionHead(nn.Module):
+    def __init__(self, in_steps: int, out_steps: int):
+        super().__init__()
+        self.in_steps = int(in_steps)
+        self.out_steps = int(out_steps)
+        if self.in_steps < 1 or self.out_steps < 1:
+            raise ValueError(
+                f"EarthFarseer temporal projection requires positive step counts, got in={in_steps}, out={out_steps}."
+            )
+        self.proj = nn.Identity() if self.in_steps == self.out_steps else nn.Linear(self.in_steps, self.out_steps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.in_steps == self.out_steps:
+            return x
+        # Project along the time axis per spatial location/channel instead of relying on wrapper-side truncation.
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        x = self.proj(x)
+        return x.permute(0, 4, 1, 2, 3).contiguous()
 
 
 class FoTF(nn.Module):
@@ -321,21 +391,28 @@ class FoTF(nn.Module):
         num_interactions: int = 3,
         patch_size: int = 16,
         embed_dim: int = 768,
-        depth: int = 12,
+        spatial_depth: int = 12,
         mlp_ratio: float = 4.0,
         drop: float = 0.0,
         drop_path: float = 0.0,
+        local_hidden_channels: int = 16,
+        local_depth: int = 3,
     ):
         super().__init__()
         T, C, H, W = shape_in
-        self.local_branch = LocalCNNBranch(in_channels=C, out_channels=C)
+        self.local_branch = LocalCNNBranch(
+            in_channels=C,
+            out_channels=C,
+            hidden_channels=local_hidden_channels,
+            num_layers=local_depth,
+        )
         self.global_branch = GlobalFourierBlock(
             img_size=(H, W),
             patch_size=patch_size,
             in_channels=C,
             out_channels=C,
             embed_dim=embed_dim,
-            depth=depth,
+            depth=spatial_depth,
             mlp_ratio=mlp_ratio,
             drop=drop,
             drop_path=drop_path,
@@ -376,7 +453,7 @@ class TemporalEvolutionBlock(nn.Module):
         N_T: int,
         h: int,
         w: int,
-        depth: int,
+        temporal_depth: int,
         incep_ker: Sequence[int] = (3, 5, 7, 11),
         groups: int = 8,
         mlp_ratio: float = 4.0,
@@ -386,8 +463,6 @@ class TemporalEvolutionBlock(nn.Module):
         super().__init__()
         if N_T < 2:
             raise ValueError(f"EarthFarseer temporal block requires N_T >= 2, but got {N_T}.")
-        if depth < 1:
-            raise ValueError(f"EarthFarseer Fourier depth must be >= 1, but got {depth}.")
         self.N_T = N_T
 
         enc_layers = [Inception(channel_in, channel_hid // 2, channel_hid, incep_ker=list(incep_ker), groups=groups)]
@@ -423,7 +498,7 @@ class TemporalEvolutionBlock(nn.Module):
                     h=h,
                     w=w,
                 )
-                for _ in range(depth)
+                for _ in range(temporal_depth)
             ]
         )
         self.dec = nn.Sequential(*dec_layers)
@@ -468,25 +543,43 @@ class EarthFarseer_Model(nn.Module):
         patch_size: int = 16,
         embed_dim: int = 768,
         depth: int = 12,
+        spatial_depth: Optional[int] = None,
+        temporal_depth: Optional[int] = None,
         mlp_ratio: float = 4.0,
         drop: float = 0.0,
         drop_path: float = 0.0,
+        out_T: Optional[int] = None,
     ):
         super().__init__()
         T, C, H, W = shape_in
+        resolved_out_T = T if out_T is None else int(out_T)
+        # Keep the legacy single depth knob working while allowing separate spatial/temporal control.
+        spatial_depth = _resolve_depth(spatial_depth, depth, name="spatial depth")
+        temporal_depth = _resolve_depth(temporal_depth, depth, name="temporal depth")
+        self.in_T = T
+        self.out_T = resolved_out_T
         self.fotf_encoder = FoTF(
             shape_in=shape_in,
             num_interactions=num_interactions,
             patch_size=patch_size,
             embed_dim=embed_dim,
-            depth=depth,
+            spatial_depth=spatial_depth,
             mlp_ratio=mlp_ratio,
             drop=drop,
             drop_path=drop_path,
         )
-        self.skip_connection = ResidualSkipConnection(shape_in=shape_in, incep_ker=incep_ker, groups=groups)
+        self.skip_connection = ResidualSkipConnection(
+            shape_in=shape_in,
+            hid_S=hid_S,
+            hid_T=hid_T,
+            N_S=N_S,
+            N_T=N_T,
+            incep_ker=incep_ker,
+            groups=groups,
+        )
         self.latent_projection = SimVPEncoder(C, hid_S, N_S)
         self.dec = SimVPDecoder(hid_S, C, N_S)
+        self.temporal_head = TemporalProjectionHead(T, resolved_out_T)
 
         with torch.no_grad():
             latent, _ = self.latent_projection(torch.zeros(1, C, H, W))
@@ -498,7 +591,7 @@ class EarthFarseer_Model(nn.Module):
             N_T,
             h_lat,
             w_lat,
-            depth=depth,
+            temporal_depth=temporal_depth,
             incep_ker=incep_ker,
             groups=groups,
             mlp_ratio=mlp_ratio,
@@ -521,4 +614,5 @@ class EarthFarseer_Model(nn.Module):
 
         predictions = self.dec(spatiotemporal_embed, spatial_skip)
         predictions = predictions.reshape(B, T, C, H, W)
-        return predictions + skip_feature
+        predictions = predictions + skip_feature
+        return self.temporal_head(predictions)

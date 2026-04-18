@@ -1,5 +1,5 @@
 import torch.nn as nn
-from typing import Tuple
+from typing import Optional, Tuple
 
 from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
@@ -70,6 +70,8 @@ class SimVPForecast(nn.Module):
         earthfarseer_patch_size: int = 16,
         earthfarseer_embed_dim: int = 768,
         earthfarseer_depth: int = 12,
+        earthfarseer_spatial_depth: Optional[int] = None,
+        earthfarseer_temporal_depth: Optional[int] = None,
         earthfarseer_mlp_ratio: float = 4.0,
         earthfarseer_drop: float = 0.0,
         earthfarseer_drop_path: float = 0.0,
@@ -144,9 +146,12 @@ class SimVPForecast(nn.Module):
                 patch_size=earthfarseer_patch_size,
                 embed_dim=earthfarseer_embed_dim,
                 depth=earthfarseer_depth,
+                spatial_depth=earthfarseer_spatial_depth,
+                temporal_depth=earthfarseer_temporal_depth,
                 mlp_ratio=earthfarseer_mlp_ratio,
                 drop=earthfarseer_drop,
                 drop_path=earthfarseer_drop_path,
+                out_T=out_T,
             )
         elif self.arch == "convlstm":
             if convlstm_stride != 1:
@@ -229,8 +234,10 @@ class SimVPForecast(nn.Module):
             )
         else:
             y = self.backbone(x)
-        if self.arch in ("simvp", "tau", "earthfarseer"):
+        if self.arch in ("simvp", "tau"):
             y = y[:, :self.out_T]
+            return y
+        if self.arch == "earthfarseer":
             return y
         if self.arch == "predrnnpp":
             if return_loss:

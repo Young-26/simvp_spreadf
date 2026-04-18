@@ -167,7 +167,27 @@ def build_parser():
     parser.add_argument("--earthfarseer_num_interactions", type=int, default=3)
     parser.add_argument("--earthfarseer_patch_size", type=int, default=16)
     parser.add_argument("--earthfarseer_embed_dim", type=int, default=768)
-    parser.add_argument("--earthfarseer_depth", type=int, default=12)
+    parser.add_argument(
+        "--earthfarseer_depth",
+        type=int,
+        default=12,
+        help=(
+            "Legacy EarthFarseer Fourier depth alias. Used for both spatial and temporal Fourier stacks "
+            "unless --earthfarseer_spatial_depth or --earthfarseer_temporal_depth is set."
+        ),
+    )
+    parser.add_argument(
+        "--earthfarseer_spatial_depth",
+        type=int,
+        default=None,
+        help="EarthFarseer FoTF/global Fourier block depth. Defaults to --earthfarseer_depth.",
+    )
+    parser.add_argument(
+        "--earthfarseer_temporal_depth",
+        type=int,
+        default=None,
+        help="EarthFarseer temporal Fourier block depth. Defaults to --earthfarseer_depth.",
+    )
     parser.add_argument("--earthfarseer_mlp_ratio", type=float, default=4.0)
     parser.add_argument("--earthfarseer_drop", type=float, default=0.0)
     parser.add_argument("--earthfarseer_drop_path", type=float, default=0.0)
@@ -1137,6 +1157,8 @@ def main():
                 f"earthfarseer_patch_size: {args.earthfarseer_patch_size}  "
                 f"earthfarseer_embed_dim: {args.earthfarseer_embed_dim}  "
                 f"earthfarseer_depth: {args.earthfarseer_depth}  "
+                f"earthfarseer_spatial_depth: {args.earthfarseer_spatial_depth}  "
+                f"earthfarseer_temporal_depth: {args.earthfarseer_temporal_depth}  "
                 f"earthfarseer_mlp_ratio: {args.earthfarseer_mlp_ratio}  "
                 f"earthfarseer_drop: {args.earthfarseer_drop}  "
                 f"earthfarseer_drop_path: {args.earthfarseer_drop_path}"
@@ -1259,6 +1281,8 @@ def main():
         earthfarseer_patch_size=args.earthfarseer_patch_size,
         earthfarseer_embed_dim=args.earthfarseer_embed_dim,
         earthfarseer_depth=args.earthfarseer_depth,
+        earthfarseer_spatial_depth=args.earthfarseer_spatial_depth,
+        earthfarseer_temporal_depth=args.earthfarseer_temporal_depth,
         earthfarseer_mlp_ratio=args.earthfarseer_mlp_ratio,
         earthfarseer_drop=args.earthfarseer_drop,
         earthfarseer_drop_path=args.earthfarseer_drop_path,

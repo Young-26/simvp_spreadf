@@ -122,6 +122,17 @@ def build_forecast_model_kwargs_from_config(
     local_top = int(_coalesce(overrides.get("local_top"), config.get("local_top"), 186))
     local_bottom = int(_coalesce(overrides.get("local_bottom"), config.get("local_bottom"), 410))
     local_crop = (local_top, local_bottom)
+    earthfarseer_depth = int(_coalesce(overrides.get("earthfarseer_depth"), config.get("earthfarseer_depth"), 12))
+    earthfarseer_spatial_depth = _coalesce(
+        overrides.get("earthfarseer_spatial_depth"),
+        config.get("earthfarseer_spatial_depth"),
+        None,
+    )
+    earthfarseer_temporal_depth = _coalesce(
+        overrides.get("earthfarseer_temporal_depth"),
+        config.get("earthfarseer_temporal_depth"),
+        None,
+    )
 
     kwargs = {
         "in_T": in_T,
@@ -150,7 +161,11 @@ def build_forecast_model_kwargs_from_config(
         "earthfarseer_num_interactions": int(config.get("earthfarseer_num_interactions", 3)),
         "earthfarseer_patch_size": int(config.get("earthfarseer_patch_size", 16)),
         "earthfarseer_embed_dim": int(config.get("earthfarseer_embed_dim", 768)),
-        "earthfarseer_depth": int(config.get("earthfarseer_depth", 12)),
+        "earthfarseer_depth": earthfarseer_depth,
+        "earthfarseer_spatial_depth": None if earthfarseer_spatial_depth is None else int(earthfarseer_spatial_depth),
+        "earthfarseer_temporal_depth": None
+        if earthfarseer_temporal_depth is None
+        else int(earthfarseer_temporal_depth),
         "earthfarseer_mlp_ratio": float(config.get("earthfarseer_mlp_ratio", 4.0)),
         "earthfarseer_drop": float(config.get("earthfarseer_drop", 0.0)),
         "earthfarseer_drop_path": float(config.get("earthfarseer_drop_path", 0.0)),
@@ -184,6 +199,11 @@ def build_forecast_model_kwargs_from_config(
         "simvp_recipe": simvp_recipe,
         "simvp_recipe_effective": get_effective_simvp_recipe(arch, simvp_model_type, simvp_recipe),
         "predrnnpp_recipe": predrnnpp_recipe,
+        "earthfarseer_depth": earthfarseer_depth,
+        "earthfarseer_spatial_depth": None if earthfarseer_spatial_depth is None else int(earthfarseer_spatial_depth),
+        "earthfarseer_temporal_depth": None
+        if earthfarseer_temporal_depth is None
+        else int(earthfarseer_temporal_depth),
         "use_local_branch": use_local_branch,
         "local_crop": local_crop,
     }
