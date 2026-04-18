@@ -1,7 +1,10 @@
+import math
+
 import torch
 from torch import nn
 
 from .modules import ConvSC, Inception
+from .simvp_config import normalize_simvp_model_type
 from .tau_model import Decoder as MetaDecoder
 from .tau_model import DropPath, Encoder as MetaEncoder, MixMlp
 
@@ -180,7 +183,7 @@ class GASubBlock(nn.Module):
         elif isinstance(module, nn.Conv2d):
             fan_out = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
             fan_out //= module.groups
-            module.weight.data.normal_(0, torch.sqrt(torch.tensor(2.0 / fan_out)).item())
+            module.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
             if module.bias is not None:
                 module.bias.data.zero_()
 
@@ -309,11 +312,7 @@ class SimVP(nn.Module):
     ):
         super(SimVP, self).__init__()
         T, C, _, _ = shape_in
-        model_type = "incepu" if model_type is None else str(model_type).lower()
-        if model_type in ("v1", "simvpv1"):
-            model_type = "incepu"
-        elif model_type in ("v2", "simvpv2"):
-            model_type = "gsta"
+        model_type = normalize_simvp_model_type(model_type)
         self.model_type = model_type
 
         if model_type == "incepu":

@@ -5,6 +5,13 @@ from .convlstm_model import ConvLSTM_Model
 from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
 from .predrnnpp_model import PredRNNpp_Model
+from .simvp_config import (
+    PREDRNNPP_RECIPE_CHOICES,
+    get_effective_simvp_recipe,
+    normalize_predrnnpp_recipe,
+    normalize_simvp_model_type,
+    normalize_simvp_recipe,
+)
 from .tau_model import TAU_Model
 
 
@@ -24,6 +31,7 @@ class SimVPForecast(nn.Module):
         N_S: int = 4,
         N_T: int = 4,
         simvp_model_type: str = "incepu",
+        simvp_recipe: str = "auto",
         simvp_spatio_kernel_enc: int = 3,
         simvp_spatio_kernel_dec: int = 3,
         simvp_mlp_ratio: float = 8.0,
@@ -59,18 +67,20 @@ class SimVPForecast(nn.Module):
         super().__init__()
         self.arch = arch.lower()
         self.out_T = out_T
-        self.predrnnpp_recipe = str(predrnnpp_recipe).lower()
-        self.simvp_model_type = "incepu" if simvp_model_type is None else str(simvp_model_type).lower()
+        self.predrnnpp_recipe = normalize_predrnnpp_recipe(predrnnpp_recipe)
+        self.simvp_model_type = normalize_simvp_model_type(simvp_model_type)
+        self.simvp_recipe = normalize_simvp_recipe(simvp_recipe)
+        self.simvp_recipe_effective = get_effective_simvp_recipe(
+            self.arch,
+            self.simvp_model_type,
+            self.simvp_recipe,
+        )
 
         if use_local_branch and self.arch != "hybrid_unet_facts":
             raise ValueError("The local F-region branch is only supported by 'hybrid_unet_facts'.")
-        if self.arch == "predrnnpp" and self.predrnnpp_recipe not in ("simvp", "openstl"):
+        if self.arch == "predrnnpp" and self.predrnnpp_recipe not in PREDRNNPP_RECIPE_CHOICES:
             raise ValueError(
-                f"Unsupported PredRNN++ recipe '{predrnnpp_recipe}'. Available choices: ('simvp', 'openstl')."
-            )
-        if self.arch == "simvp" and self.simvp_model_type not in ("incepu", "gsta", "v1", "v2", "simvpv1", "simvpv2"):
-            raise ValueError(
-                f"Unsupported SimVP model_type '{simvp_model_type}'. Available choices: ('incepu', 'gsta')."
+                f"Unsupported PredRNN++ recipe '{predrnnpp_recipe}'. Available choices: {PREDRNNPP_RECIPE_CHOICES}."
             )
 
         if self.arch == "simvp":

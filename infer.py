@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 from contextlib import nullcontext
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -9,10 +10,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets.ionogram_manifest import IonogramManifestDataset
+from simvp.simvp_config import (
+    PREDRNNPP_RECIPE_CHOICES,
+    SIMVP_MODEL_TYPE_ALIASES,
+    SIMVP_RECIPE_CHOICES,
+    build_forecast_model_kwargs_from_config,
+)
 from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -25,15 +32,20 @@ def parse_args():
     parser.add_argument("--in_T", type=int, default=None)
     parser.add_argument("--out_T", type=int, default=None)
     parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
-    parser.add_argument("--simvp_model_type", type=str, default=None, choices=["incepu", "gsta"])
-    parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=["simvp", "openstl"])
+    parser.add_argument("--simvp_model_type", type=str, default=None, choices=SIMVP_MODEL_TYPE_ALIASES)
+    parser.add_argument("--simvp_recipe", type=str, default=None, choices=SIMVP_RECIPE_CHOICES)
+    parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=PREDRNNPP_RECIPE_CHOICES)
     parser.add_argument("--use_local_branch", action="store_true", default=None)
     parser.add_argument("--local_top", type=int, default=None)
     parser.add_argument("--local_bottom", type=int, default=None)
     parser.add_argument("--report_local_metrics", action="store_true")
     parser.add_argument("--strict_local_infer", action="store_true")
     parser.add_argument("--max_batches", type=int, default=None)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: Optional[Sequence[str]] = None):
+    return build_parser().parse_args(argv)
 
 
 def collate_fn(batch):
@@ -184,6 +196,22 @@ def validate_dataset_sequence_lengths(dataset, in_T: int, out_T: int):
         )
 
 
+def build_model_from_saved_args(
+    saved_args: dict,
+    *,
+    image_mode: str,
+    image_size: int,
+    overrides: Optional[dict] = None,
+):
+    model_kwargs, model_cfg = build_forecast_model_kwargs_from_config(
+        saved_args,
+        image_mode=image_mode,
+        image_size=image_size,
+        overrides=overrides,
+    )
+    return SimVPForecast(**model_kwargs), model_cfg
+
+
 def main():
     args = parse_args()
 
@@ -193,15 +221,31 @@ def main():
 
     image_mode = resolve_override(args.image_mode, saved_args, "image_mode", "L")
     image_size = resolve_override(args.image_size, saved_args, "image_size", 448)
-    in_T = resolve_saved_first(saved_args, "in_T", args.in_T, 8)
-    out_T = resolve_saved_first(saved_args, "out_T", args.out_T, 2)
-    arch = resolve_override(args.arch, saved_args, "arch", "simvp")
-    simvp_model_type = resolve_override(args.simvp_model_type, saved_args, "simvp_model_type", "incepu")
-    predrnnpp_recipe = resolve_override(args.predrnnpp_recipe, saved_args, "predrnnpp_recipe", "simvp")
-    use_local_branch = resolve_override(args.use_local_branch, saved_args, "use_local_branch", False)
-    local_top = resolve_saved_first(saved_args, "local_top", args.local_top, 186)
-    local_bottom = resolve_saved_first(saved_args, "local_bottom", args.local_bottom, 410)
-    channels = 1 if image_mode == "L" else 3
+    overrides = {
+        "in_T": args.in_T,
+        "out_T": args.out_T,
+        "arch": args.arch,
+        "simvp_model_type": args.simvp_model_type,
+        "simvp_recipe": args.simvp_recipe,
+        "predrnnpp_recipe": args.predrnnpp_recipe,
+        "use_local_branch": args.use_local_branch,
+        "local_top": args.local_top,
+        "local_bottom": args.local_bottom,
+    }
+    model, model_cfg = build_model_from_saved_args(
+        saved_args,
+        image_mode=image_mode,
+        image_size=image_size,
+        overrides=overrides,
+    )
+    in_T = int(model_cfg["in_T"])
+    out_T = int(model_cfg["out_T"])
+    arch = str(model_cfg["arch"])
+    simvp_model_type = str(model_cfg.get("simvp_model_type", "incepu"))
+    simvp_recipe = str(model_cfg.get("simvp_recipe", "auto"))
+    predrnnpp_recipe = str(model_cfg.get("predrnnpp_recipe", "simvp"))
+    use_local_branch = bool(model_cfg["use_local_branch"])
+    local_top, local_bottom = tuple(model_cfg["local_crop"])
 
     if torch.cuda.is_available() and args.device.startswith("cuda"):
         device = torch.device(args.device)
@@ -209,49 +253,6 @@ def main():
         device = torch.device("cpu")
     amp_enabled = args.amp and device.type == "cuda"
 
-    model = SimVPForecast(
-        in_T=in_T,
-        out_T=out_T,
-        C=channels,
-        H=image_size,
-        W=image_size,
-        hid_S=saved_args.get("hid_S", 32),
-        hid_T=saved_args.get("hid_T", 128),
-        N_S=saved_args.get("N_S", 4),
-        N_T=saved_args.get("N_T", 4),
-        simvp_model_type=simvp_model_type,
-        simvp_spatio_kernel_enc=int(saved_args.get("simvp_spatio_kernel_enc", 3)),
-        simvp_spatio_kernel_dec=int(saved_args.get("simvp_spatio_kernel_dec", 3)),
-        simvp_mlp_ratio=float(saved_args.get("simvp_mlp_ratio", 8.0)),
-        simvp_drop=float(saved_args.get("simvp_drop", 0.0)),
-        simvp_drop_path=float(saved_args.get("simvp_drop_path", 0.0)),
-        tau_spatio_kernel_enc=int(saved_args.get("tau_spatio_kernel_enc", 3)),
-        tau_spatio_kernel_dec=int(saved_args.get("tau_spatio_kernel_dec", 3)),
-        tau_mlp_ratio=float(saved_args.get("tau_mlp_ratio", 8.0)),
-        tau_drop=float(saved_args.get("tau_drop", 0.0)),
-        tau_drop_path=float(saved_args.get("tau_drop_path", 0.0)),
-        convlstm_hidden=saved_args.get("convlstm_hidden", "128,128,128,128"),
-        convlstm_filter_size=int(saved_args.get("convlstm_filter_size", 5)),
-        convlstm_patch_size=int(saved_args.get("convlstm_patch_size", 4)),
-        convlstm_stride=int(saved_args.get("convlstm_stride", 1)),
-        convlstm_layer_norm=bool(saved_args.get("convlstm_layer_norm", False)),
-        predrnnpp_hidden=saved_args.get("predrnnpp_hidden", "128,128,128,128"),
-        predrnnpp_filter_size=int(saved_args.get("predrnnpp_filter_size", 5)),
-        predrnnpp_patch_size=int(saved_args.get("predrnnpp_patch_size", 4)),
-        predrnnpp_stride=int(saved_args.get("predrnnpp_stride", 1)),
-        predrnnpp_layer_norm=bool(saved_args.get("predrnnpp_layer_norm", False)),
-        predrnnpp_recipe=predrnnpp_recipe,
-        predrnnpp_reverse_scheduled_sampling=bool(saved_args.get("reverse_scheduled_sampling", False)),
-        arch=arch,
-        hybrid_depth=saved_args.get("hybrid_depth", 2),
-        hybrid_heads=saved_args.get("hybrid_heads", 8),
-        hybrid_ffn_ratio=saved_args.get("hybrid_ffn_ratio", 4.0),
-        hybrid_attn_dropout=saved_args.get("hybrid_attn_dropout", 0.1),
-        hybrid_ffn_dropout=saved_args.get("hybrid_ffn_dropout", 0.1),
-        hybrid_drop_path=saved_args.get("hybrid_drop_path", 0.1),
-        use_local_branch=use_local_branch,
-        local_crop=(local_top, local_bottom),
-    )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     model.eval()
@@ -313,6 +314,9 @@ def main():
 
             if batch_idx == 1:
                 print(f"arch: {arch}")
+                if arch == "simvp":
+                    print(f"simvp_model_type: {simvp_model_type}")
+                    print(f"simvp_recipe: {simvp_recipe}")
                 if arch == "predrnnpp":
                     print(f"predrnnpp_recipe: {predrnnpp_recipe}")
                 print(f"input shape:  {tuple(x.shape)}")

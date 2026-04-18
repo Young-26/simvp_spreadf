@@ -2,11 +2,12 @@ import os
 import csv
 import time
 import math
+import sys
 import argparse
 import logging
 import traceback
 from contextlib import nullcontext
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -19,20 +20,40 @@ from tqdm import tqdm
 from torchvision.models import VGG16_Weights, vgg16
 
 from datasets.ionogram_manifest import IonogramManifestDataset
+from simvp.simvp_config import (
+    PREDRNNPP_RECIPE_CHOICES,
+    SIMVP_MODEL_TYPE_ALIASES,
+    SIMVP_OPENSTL_TRAIN_PRESET,
+    SIMVP_RECIPE_CHOICES,
+    get_effective_simvp_recipe,
+    is_simvp_gsta_openstl_recipe,
+    normalize_predrnnpp_recipe,
+    normalize_simvp_model_type,
+    normalize_simvp_recipe,
+)
 from simvp.tau_model import tau_diff_div_reg
 from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
 
 
-PREDRNNPP_RECIPES = ("simvp", "openstl")
-SIMVP_MODEL_TYPES = ("incepu", "gsta")
-
-
 def get_predrnnpp_recipe(args) -> str:
-    recipe = str(getattr(args, "predrnnpp_recipe", "simvp")).lower()
-    if recipe not in PREDRNNPP_RECIPES:
-        raise ValueError(f"Unsupported PredRNN++ recipe '{recipe}'. Available choices: {PREDRNNPP_RECIPES}.")
-    return recipe
+    return normalize_predrnnpp_recipe(getattr(args, "predrnnpp_recipe", "simvp"))
+
+
+def get_simvp_model_type(args) -> str:
+    return normalize_simvp_model_type(getattr(args, "simvp_model_type", "incepu"))
+
+
+def get_simvp_recipe(args) -> str:
+    return normalize_simvp_recipe(getattr(args, "simvp_recipe", "auto"))
+
+
+def get_effective_simvp_recipe_from_args(args) -> str:
+    return get_effective_simvp_recipe(
+        getattr(args, "arch", "simvp"),
+        get_simvp_model_type(args),
+        get_simvp_recipe(args),
+    )
 
 
 def is_predrnnpp_arch(args) -> bool:
@@ -45,6 +66,14 @@ def is_tau_arch(args) -> bool:
 
 def uses_predrnnpp_openstl_recipe(args) -> bool:
     return is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "openstl"
+
+
+def uses_simvp_gsta_openstl_recipe(args) -> bool:
+    return is_simvp_gsta_openstl_recipe(
+        getattr(args, "arch", "simvp"),
+        getattr(args, "simvp_model_type", "incepu"),
+        getattr(args, "simvp_recipe", "auto"),
+    )
 
 
 def uses_weighted_reconstruction_loss(args) -> bool:
@@ -67,10 +96,14 @@ def should_enable_ddp_find_unused_parameters(args) -> bool:
 
 
 def resolve_recipe_tag(args) -> str:
-    return get_predrnnpp_recipe(args) if is_predrnnpp_arch(args) else "default"
+    if is_predrnnpp_arch(args):
+        return get_predrnnpp_recipe(args)
+    if str(args.arch).lower() == "simvp":
+        return get_effective_simvp_recipe_from_args(args)
+    return "default"
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--train_manifest", type=str, required=True)
@@ -91,7 +124,8 @@ def parse_args():
     parser.add_argument("--hid_T", type=int, default=128)
     parser.add_argument("--N_S", type=int, default=4)
     parser.add_argument("--N_T", type=int, default=4)
-    parser.add_argument("--simvp_model_type", type=str, default="incepu", choices=SIMVP_MODEL_TYPES)
+    parser.add_argument("--simvp_model_type", type=str, default="incepu", choices=SIMVP_MODEL_TYPE_ALIASES)
+    parser.add_argument("--simvp_recipe", type=str, default="auto", choices=SIMVP_RECIPE_CHOICES)
     parser.add_argument("--simvp_spatio_kernel_enc", type=int, default=3)
     parser.add_argument("--simvp_spatio_kernel_dec", type=int, default=3)
     parser.add_argument("--simvp_mlp_ratio", type=float, default=8.0)
@@ -107,7 +141,7 @@ def parse_args():
     parser.add_argument("--predrnnpp_patch_size", type=int, default=4)
     parser.add_argument("--predrnnpp_stride", type=int, default=1)
     parser.add_argument("--predrnnpp_layer_norm", action="store_true")
-    parser.add_argument("--predrnnpp_recipe", type=str, default="simvp", choices=PREDRNNPP_RECIPES)
+    parser.add_argument("--predrnnpp_recipe", type=str, default="simvp", choices=PREDRNNPP_RECIPE_CHOICES)
     parser.add_argument("--reverse_scheduled_sampling", action="store_true")
     parser.add_argument(
         "--scheduled_sampling",
@@ -165,7 +199,46 @@ def parse_args():
     parser.add_argument("--save_dir", type=str, default="./work_dirs/simvp_spreadf")
     parser.add_argument("--seed", type=int, default=42)
 
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: Optional[Sequence[str]] = None):
+    return build_parser().parse_args(argv)
+
+
+def collect_explicit_cli_args(parser: argparse.ArgumentParser, argv: Optional[Sequence[str]] = None):
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    option_to_dest = {}
+    for action in parser._actions:
+        for option in action.option_strings:
+            option_to_dest[option] = action.dest
+
+    explicit = set()
+    for token in tokens:
+        if not token.startswith("-"):
+            continue
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest and dest != "help":
+            explicit.add(dest)
+    return explicit
+
+
+def apply_simvp_recipe_defaults(args, explicit_cli_args=None):
+    explicit_cli_args = set() if explicit_cli_args is None else set(explicit_cli_args)
+    args.simvp_model_type = get_simvp_model_type(args)
+    args.simvp_recipe = get_simvp_recipe(args)
+    args.predrnnpp_recipe = get_predrnnpp_recipe(args)
+
+    if not uses_simvp_gsta_openstl_recipe(args):
+        return args
+
+    for field, value in SIMVP_OPENSTL_TRAIN_PRESET.items():
+        if field in ("opt", "sched"):
+            continue
+        if field not in explicit_cli_args:
+            setattr(args, field, value)
+    return args
 
 
 def validate_dataset_sequence_lengths(dataset, split_name: str, in_T: int, out_T: int):
@@ -426,17 +499,23 @@ def resolve_best_metric_mode(args):
 
 def resolve_optimizer_config(args):
     args.predrnnpp_recipe = get_predrnnpp_recipe(args)
+    args.simvp_model_type = get_simvp_model_type(args)
+    args.simvp_recipe = get_simvp_recipe(args)
     opt = str(args.opt).lower()
     if opt == "auto":
-        opt = "adam" if uses_predrnnpp_openstl_recipe(args) or is_tau_arch(args) else "adamw"
+        opt = "adam" if uses_predrnnpp_openstl_recipe(args) or uses_simvp_gsta_openstl_recipe(args) or is_tau_arch(args) else "adamw"
     args.opt = opt
     return args
 
 
 def resolve_scheduler_config(args):
     args.predrnnpp_recipe = get_predrnnpp_recipe(args)
+    args.simvp_model_type = get_simvp_model_type(args)
+    args.simvp_recipe = get_simvp_recipe(args)
     if args.sched == "auto":
         if uses_predrnnpp_openstl_recipe(args):
+            args.sched = "onecycle"
+        elif uses_simvp_gsta_openstl_recipe(args):
             args.sched = "onecycle"
         elif is_tau_arch(args):
             args.sched = "cosine"
@@ -444,7 +523,12 @@ def resolve_scheduler_config(args):
             args.sched = "cosine"
         else:
             args.sched = "none"
-    if uses_weighted_reconstruction_loss(args) or uses_predrnnpp_openstl_recipe(args) or is_tau_arch(args):
+    if (
+        uses_weighted_reconstruction_loss(args)
+        or uses_predrnnpp_openstl_recipe(args)
+        or uses_simvp_gsta_openstl_recipe(args)
+        or is_tau_arch(args)
+    ):
         args.warmup_epoch = 0
     return args
 
@@ -951,7 +1035,10 @@ def write_report(
 
 
 def main():
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    explicit_cli_args = collect_explicit_cli_args(parser)
+    args = apply_simvp_recipe_defaults(args, explicit_cli_args=explicit_cli_args)
     args = resolve_optimizer_config(args)
     args = resolve_scheduler_config(args)
     args.best_metric_mode = resolve_best_metric_mode(args)
@@ -1006,7 +1093,11 @@ def main():
         logger.info(f"report_local_metrics: {args.report_local_metrics}")
         logger.info(f"best_metric_local_weight: {args.best_metric_local_weight}")
         if args.arch == "simvp":
-            logger.info(f"simvp_model_type: {args.simvp_model_type}")
+            logger.info(
+                f"simvp_model_type: {args.simvp_model_type}  "
+                f"simvp_recipe: {args.simvp_recipe}  "
+                f"resolved_simvp_recipe: {get_effective_simvp_recipe_from_args(args)}"
+            )
             if str(args.simvp_model_type).lower() == "gsta":
                 logger.info(
                     f"simvp_spatio_kernel_enc: {args.simvp_spatio_kernel_enc}  "
@@ -1130,6 +1221,7 @@ def main():
         N_S=args.N_S,
         N_T=args.N_T,
         simvp_model_type=args.simvp_model_type,
+        simvp_recipe=args.simvp_recipe,
         simvp_spatio_kernel_enc=args.simvp_spatio_kernel_enc,
         simvp_spatio_kernel_dec=args.simvp_spatio_kernel_dec,
         simvp_mlp_ratio=args.simvp_mlp_ratio,

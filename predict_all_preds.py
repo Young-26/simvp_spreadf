@@ -31,7 +31,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
-from skimage.metrics import structural_similarity as skimage_ssim
 from tqdm import tqdm
 
 import torch
@@ -39,14 +38,25 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from datasets.ionogram_manifest import IonogramManifestDataset
-from simvp.wrapper import SimVPForecast
+from simvp.simvp_config import (
+    PREDRNNPP_RECIPE_CHOICES,
+    SIMVP_MODEL_TYPE_ALIASES,
+    SIMVP_RECIPE_CHOICES,
+    build_forecast_model_kwargs_from_config,
+)
+from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
+
+try:
+    from skimage.metrics import structural_similarity as skimage_ssim
+except ImportError:
+    skimage_ssim = None
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Per-sample evaluation and case-study export for simvp_spreadf")
     parser.add_argument("--val_manifest", type=str, required=True, help="Validation manifest JSONL")
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path, e.g. best.ckpt")
@@ -65,6 +75,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Use autocast during inference")
     parser.add_argument("--pin_memory", action="store_true", default=True)
     parser.add_argument("--no_pin_memory", action="store_true", help="Disable pin_memory")
+    parser.add_argument("--arch", type=str, default=None, choices=SUPPORTED_ARCHS)
+    parser.add_argument("--simvp_model_type", type=str, default=None, choices=SIMVP_MODEL_TYPE_ALIASES)
+    parser.add_argument("--simvp_recipe", type=str, default=None, choices=SIMVP_RECIPE_CHOICES)
+    parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=PREDRNNPP_RECIPE_CHOICES)
+    parser.add_argument("--image_mode", type=str, default=None, choices=["L", "RGB"])
+    parser.add_argument("--image_size", type=int, default=None)
+    parser.add_argument("--in_T", type=int, default=None)
+    parser.add_argument("--out_T", type=int, default=None)
+    parser.add_argument("--use_local_branch", action="store_true", default=None)
+    parser.add_argument("--local_top", type=int, default=None)
+    parser.add_argument("--local_bottom", type=int, default=None)
 
     parser.add_argument("--save_selected", action="store_true", help="Save mosaics for selected groups")
     parser.add_argument("--save_pred_frames", action="store_true", help="Save standalone pred_01.png / pred_02.png for selected groups")
@@ -80,7 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_samples", type=int, default=None, help="Optional cap for quick profiling / debug")
     parser.add_argument("--skip_ssim", action="store_true", help="Skip SSIM to speed up evaluation")
 
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def choose_device(device_arg: str) -> torch.device:
@@ -214,6 +239,11 @@ def psnr_from_mse(mse: torch.Tensor, data_range: float = 1.0, eps: float = 1e-8)
 
 
 def ssim_per_frame(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> torch.Tensor:
+    if skimage_ssim is None:
+        raise ImportError(
+            "predict_all_preds.py requires scikit-image for SSIM metrics. "
+            "Install 'scikit-image' or rerun with --skip_ssim."
+        )
     pred_np = pred.detach().float().cpu().numpy()
     target_np = target.detach().float().cpu().numpy()
     bsz, t_len, c, _, _ = pred_np.shape
@@ -484,70 +514,15 @@ def build_model_from_ckpt_args(
     ckpt_args: Dict[str, Any],
     image_mode: str,
     image_size: int,
+    overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[SimVPForecast, Dict[str, Any]]:
-    channels = 1 if image_mode == "L" else 3
-    in_T = int(ckpt_args.get("in_T", 8))
-    out_T = int(ckpt_args.get("out_T", 2))
-    arch = str(ckpt_args.get("arch", "simvp"))
-    simvp_model_type = str(ckpt_args.get("simvp_model_type", "incepu"))
-    predrnnpp_recipe = str(ckpt_args.get("predrnnpp_recipe", "simvp"))
-    use_local_branch = bool(ckpt_args.get("use_local_branch", False))
-    local_top = int(ckpt_args.get("local_top", 186))
-    local_bottom = int(ckpt_args.get("local_bottom", 410))
-    local_crop = (local_top, local_bottom)
-
-    model = SimVPForecast(
-        in_T=in_T,
-        out_T=out_T,
-        C=channels,
-        H=image_size,
-        W=image_size,
-        hid_S=int(ckpt_args.get("hid_S", 32)),
-        hid_T=int(ckpt_args.get("hid_T", 128)),
-        N_S=int(ckpt_args.get("N_S", 4)),
-        N_T=int(ckpt_args.get("N_T", 4)),
-        simvp_model_type=simvp_model_type,
-        simvp_spatio_kernel_enc=int(ckpt_args.get("simvp_spatio_kernel_enc", 3)),
-        simvp_spatio_kernel_dec=int(ckpt_args.get("simvp_spatio_kernel_dec", 3)),
-        simvp_mlp_ratio=float(ckpt_args.get("simvp_mlp_ratio", 8.0)),
-        simvp_drop=float(ckpt_args.get("simvp_drop", 0.0)),
-        simvp_drop_path=float(ckpt_args.get("simvp_drop_path", 0.0)),
-        tau_spatio_kernel_enc=int(ckpt_args.get("tau_spatio_kernel_enc", 3)),
-        tau_spatio_kernel_dec=int(ckpt_args.get("tau_spatio_kernel_dec", 3)),
-        tau_mlp_ratio=float(ckpt_args.get("tau_mlp_ratio", 8.0)),
-        tau_drop=float(ckpt_args.get("tau_drop", 0.0)),
-        tau_drop_path=float(ckpt_args.get("tau_drop_path", 0.0)),
-        convlstm_hidden=str(ckpt_args.get("convlstm_hidden", "128,128,128,128")),
-        convlstm_filter_size=int(ckpt_args.get("convlstm_filter_size", 5)),
-        convlstm_patch_size=int(ckpt_args.get("convlstm_patch_size", 4)),
-        convlstm_stride=int(ckpt_args.get("convlstm_stride", 1)),
-        convlstm_layer_norm=bool(ckpt_args.get("convlstm_layer_norm", False)),
-        predrnnpp_hidden=str(ckpt_args.get("predrnnpp_hidden", "128,128,128,128")),
-        predrnnpp_filter_size=int(ckpt_args.get("predrnnpp_filter_size", 5)),
-        predrnnpp_patch_size=int(ckpt_args.get("predrnnpp_patch_size", 4)),
-        predrnnpp_stride=int(ckpt_args.get("predrnnpp_stride", 1)),
-        predrnnpp_layer_norm=bool(ckpt_args.get("predrnnpp_layer_norm", False)),
-        predrnnpp_recipe=predrnnpp_recipe,
-        predrnnpp_reverse_scheduled_sampling=bool(ckpt_args.get("reverse_scheduled_sampling", False)),
-        arch=arch,
-        hybrid_depth=int(ckpt_args.get("hybrid_depth", 2)),
-        hybrid_heads=int(ckpt_args.get("hybrid_heads", 8)),
-        hybrid_ffn_ratio=float(ckpt_args.get("hybrid_ffn_ratio", 4.0)),
-        hybrid_attn_dropout=float(ckpt_args.get("hybrid_attn_dropout", 0.1)),
-        hybrid_ffn_dropout=float(ckpt_args.get("hybrid_ffn_dropout", 0.1)),
-        hybrid_drop_path=float(ckpt_args.get("hybrid_drop_path", 0.1)),
-        use_local_branch=use_local_branch,
-        local_crop=local_crop,
+    model_kwargs, model_cfg = build_forecast_model_kwargs_from_config(
+        ckpt_args,
+        image_mode=image_mode,
+        image_size=image_size,
+        overrides=overrides,
     )
-    return model, {
-        "in_T": in_T,
-        "out_T": out_T,
-        "arch": arch,
-        "simvp_model_type": simvp_model_type,
-        "predrnnpp_recipe": predrnnpp_recipe,
-        "use_local_branch": use_local_branch,
-        "local_crop": local_crop,
-    }
+    return SimVPForecast(**model_kwargs), model_cfg
 
 
 @torch.no_grad()
@@ -691,12 +666,30 @@ def main() -> None:
     ckpt = load_checkpoint(args.checkpoint, map_location="cpu")
     ckpt_args: Dict[str, Any] = ckpt.get("args", {}) if isinstance(ckpt.get("args", {}), dict) else {}
 
-    image_mode = str(ckpt_args.get("image_mode", "L"))
-    image_size = int(ckpt_args.get("image_size", 448))
-    model, model_cfg = build_model_from_ckpt_args(ckpt_args, image_mode=image_mode, image_size=image_size)
+    image_mode = str(coalesce(args.image_mode, ckpt_args.get("image_mode"), default="L"))
+    image_size = int(coalesce(args.image_size, ckpt_args.get("image_size"), default=448))
+    overrides = {
+        "in_T": args.in_T,
+        "out_T": args.out_T,
+        "arch": args.arch,
+        "simvp_model_type": args.simvp_model_type,
+        "simvp_recipe": args.simvp_recipe,
+        "predrnnpp_recipe": args.predrnnpp_recipe,
+        "use_local_branch": args.use_local_branch,
+        "local_top": args.local_top,
+        "local_bottom": args.local_bottom,
+    }
+    model, model_cfg = build_model_from_ckpt_args(
+        ckpt_args,
+        image_mode=image_mode,
+        image_size=image_size,
+        overrides=overrides,
+    )
     in_T = int(model_cfg["in_T"])
     out_T = int(model_cfg["out_T"])
     arch = str(model_cfg["arch"])
+    simvp_model_type = str(model_cfg.get("simvp_model_type", "incepu"))
+    simvp_recipe = str(model_cfg.get("simvp_recipe", "auto"))
     predrnnpp_recipe = str(model_cfg.get("predrnnpp_recipe", "simvp"))
     use_local_branch = bool(model_cfg["use_local_branch"])
     local_crop = tuple(model_cfg["local_crop"])
@@ -712,6 +705,8 @@ def main() -> None:
     print(f"[Info] device={device}")
     print(f"[Info] image_mode={image_mode}, image_size={image_size}")
     print(f"[Info] arch={arch}, in_T={in_T}, out_T={out_T}, use_local_branch={use_local_branch}")
+    if arch == "simvp":
+        print(f"[Info] simvp_model_type={simvp_model_type}, simvp_recipe={simvp_recipe}")
     if arch == "predrnnpp":
         print(f"[Info] predrnnpp_recipe={predrnnpp_recipe}")
     if use_local_branch:
