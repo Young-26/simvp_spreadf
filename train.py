@@ -162,6 +162,15 @@ def build_parser():
     parser.add_argument("--tau_drop", type=float, default=0.0)
     parser.add_argument("--tau_drop_path", type=float, default=0.0)
     parser.add_argument("--tau_alpha", type=float, default=0.1)
+    parser.add_argument("--earthfarseer_incep_ker", type=str, default="3,5,7,11")
+    parser.add_argument("--earthfarseer_groups", type=int, default=8)
+    parser.add_argument("--earthfarseer_num_interactions", type=int, default=3)
+    parser.add_argument("--earthfarseer_patch_size", type=int, default=16)
+    parser.add_argument("--earthfarseer_embed_dim", type=int, default=768)
+    parser.add_argument("--earthfarseer_depth", type=int, default=12)
+    parser.add_argument("--earthfarseer_mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--earthfarseer_drop", type=float, default=0.0)
+    parser.add_argument("--earthfarseer_drop_path", type=float, default=0.0)
     parser.add_argument("--hybrid_depth", type=int, default=2)
     parser.add_argument("--hybrid_heads", type=int, default=8)
     parser.add_argument("--hybrid_ffn_ratio", type=float, default=4.0)
@@ -1120,6 +1129,18 @@ def main():
                     "TAU diff_div_reg is inactive when out_T<=2. Under the current dataset setting, "
                     "the TAU training loss reduces to plain MSE."
                 )
+        if args.arch == "earthfarseer":
+            logger.info(
+                f"earthfarseer_incep_ker: {args.earthfarseer_incep_ker}  "
+                f"earthfarseer_groups: {args.earthfarseer_groups}  "
+                f"earthfarseer_num_interactions: {args.earthfarseer_num_interactions}  "
+                f"earthfarseer_patch_size: {args.earthfarseer_patch_size}  "
+                f"earthfarseer_embed_dim: {args.earthfarseer_embed_dim}  "
+                f"earthfarseer_depth: {args.earthfarseer_depth}  "
+                f"earthfarseer_mlp_ratio: {args.earthfarseer_mlp_ratio}  "
+                f"earthfarseer_drop: {args.earthfarseer_drop}  "
+                f"earthfarseer_drop_path: {args.earthfarseer_drop_path}"
+            )
         if args.arch == "hybrid_unet_facts":
             logger.info(
                 "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
@@ -1232,6 +1253,15 @@ def main():
         tau_mlp_ratio=args.tau_mlp_ratio,
         tau_drop=args.tau_drop,
         tau_drop_path=args.tau_drop_path,
+        earthfarseer_incep_ker=args.earthfarseer_incep_ker,
+        earthfarseer_groups=args.earthfarseer_groups,
+        earthfarseer_num_interactions=args.earthfarseer_num_interactions,
+        earthfarseer_patch_size=args.earthfarseer_patch_size,
+        earthfarseer_embed_dim=args.earthfarseer_embed_dim,
+        earthfarseer_depth=args.earthfarseer_depth,
+        earthfarseer_mlp_ratio=args.earthfarseer_mlp_ratio,
+        earthfarseer_drop=args.earthfarseer_drop,
+        earthfarseer_drop_path=args.earthfarseer_drop_path,
         convlstm_hidden=args.convlstm_hidden,
         convlstm_filter_size=args.convlstm_filter_size,
         convlstm_patch_size=args.convlstm_patch_size,

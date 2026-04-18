@@ -16,7 +16,7 @@ from simvp.simvp_config import (
     get_effective_simvp_recipe,
     normalize_simvp_model_type,
 )
-from simvp.wrapper import SimVPForecast
+from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 
 
 def _get_action_choices(parser, dest: str):
@@ -59,6 +59,9 @@ class SimVPConfigTests(unittest.TestCase):
             normalize_simvp_model_type("invalid")
 
     def test_cli_choices_are_consistent(self):
+        self.assertEqual(_get_action_choices(train_lib.build_parser(), "arch"), SUPPORTED_ARCHS)
+        self.assertEqual(_get_action_choices(infer_lib.build_parser(), "arch"), SUPPORTED_ARCHS)
+        self.assertEqual(_get_action_choices(predict_lib.build_parser(), "arch"), SUPPORTED_ARCHS)
         self.assertEqual(_get_action_choices(train_lib.build_parser(), "simvp_model_type"), SIMVP_MODEL_TYPE_ALIASES)
         self.assertEqual(_get_action_choices(infer_lib.build_parser(), "simvp_model_type"), SIMVP_MODEL_TYPE_ALIASES)
         self.assertEqual(_get_action_choices(predict_lib.build_parser(), "simvp_model_type"), SIMVP_MODEL_TYPE_ALIASES)

@@ -2,6 +2,7 @@ import torch.nn as nn
 from typing import Tuple
 
 from .convlstm_model import ConvLSTM_Model
+from .earthfarseer_model import EarthFarseer_Model
 from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
 from .predrnnpp_model import PredRNNpp_Model
@@ -15,7 +16,7 @@ from .simvp_config import (
 from .tau_model import TAU_Model
 
 
-SUPPORTED_ARCHS = ("simvp", "tau", "hybrid_unet_facts", "convlstm", "predrnnpp")
+SUPPORTED_ARCHS = ("simvp", "tau", "earthfarseer", "hybrid_unet_facts", "convlstm", "predrnnpp")
 
 
 class SimVPForecast(nn.Module):
@@ -63,6 +64,15 @@ class SimVPForecast(nn.Module):
         tau_mlp_ratio: float = 8.0,
         tau_drop: float = 0.0,
         tau_drop_path: float = 0.0,
+        earthfarseer_incep_ker="3,5,7,11",
+        earthfarseer_groups: int = 8,
+        earthfarseer_num_interactions: int = 3,
+        earthfarseer_patch_size: int = 16,
+        earthfarseer_embed_dim: int = 768,
+        earthfarseer_depth: int = 12,
+        earthfarseer_mlp_ratio: float = 4.0,
+        earthfarseer_drop: float = 0.0,
+        earthfarseer_drop_path: float = 0.0,
     ):
         super().__init__()
         self.arch = arch.lower()
@@ -109,6 +119,34 @@ class SimVPForecast(nn.Module):
                 mlp_ratio=tau_mlp_ratio,
                 drop=tau_drop,
                 drop_path=tau_drop_path,
+            )
+        elif self.arch == "earthfarseer":
+            if isinstance(earthfarseer_incep_ker, str):
+                earthfarseer_incep_ker = tuple(
+                    int(part.strip())
+                    for part in earthfarseer_incep_ker.split(",")
+                    if part.strip()
+                )
+            else:
+                earthfarseer_incep_ker = tuple(int(part) for part in earthfarseer_incep_ker)
+            if not earthfarseer_incep_ker:
+                raise ValueError("earthfarseer_incep_ker must contain at least one kernel size.")
+
+            self.backbone = EarthFarseer_Model(
+                shape_in=(in_T, C, H, W),
+                hid_S=hid_S,
+                hid_T=hid_T,
+                N_S=N_S,
+                N_T=N_T,
+                incep_ker=earthfarseer_incep_ker,
+                groups=earthfarseer_groups,
+                num_interactions=earthfarseer_num_interactions,
+                patch_size=earthfarseer_patch_size,
+                embed_dim=earthfarseer_embed_dim,
+                depth=earthfarseer_depth,
+                mlp_ratio=earthfarseer_mlp_ratio,
+                drop=earthfarseer_drop,
+                drop_path=earthfarseer_drop_path,
             )
         elif self.arch == "convlstm":
             if convlstm_stride != 1:
@@ -191,7 +229,7 @@ class SimVPForecast(nn.Module):
             )
         else:
             y = self.backbone(x)
-        if self.arch in ("simvp", "tau"):
+        if self.arch in ("simvp", "tau", "earthfarseer"):
             y = y[:, :self.out_T]
             return y
         if self.arch == "predrnnpp":
