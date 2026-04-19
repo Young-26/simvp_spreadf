@@ -45,6 +45,13 @@ class ChannelAggregationFFN(nn.Module):
 
 
 class MultiOrderDWConv(nn.Module):
+    _LEGACY_STATE_DICT_KEY_MAP = {
+        "dw_conv0": "DW_conv0",
+        "dw_conv1": "DW_conv1",
+        "dw_conv2": "DW_conv2",
+        "pw_conv": "PW_conv",
+    }
+
     def __init__(self, embed_dims: int, dw_dilation=(1, 2, 3), channel_split=(1, 3, 4)):
         super().__init__()
         if len(dw_dilation) != 3 or len(channel_split) != 3:
@@ -60,7 +67,7 @@ class MultiOrderDWConv(nn.Module):
         self.embed_dims_0 = embed_dims - self.embed_dims_1 - self.embed_dims_2
         self.embed_dims = embed_dims
 
-        self.dw_conv0 = nn.Conv2d(
+        self.DW_conv0 = nn.Conv2d(
             embed_dims,
             embed_dims,
             kernel_size=5,
@@ -69,7 +76,7 @@ class MultiOrderDWConv(nn.Module):
             stride=1,
             dilation=dw_dilation[0],
         )
-        self.dw_conv1 = nn.Conv2d(
+        self.DW_conv1 = nn.Conv2d(
             self.embed_dims_1,
             self.embed_dims_1,
             kernel_size=5,
@@ -78,7 +85,7 @@ class MultiOrderDWConv(nn.Module):
             stride=1,
             dilation=dw_dilation[1],
         )
-        self.dw_conv2 = nn.Conv2d(
+        self.DW_conv2 = nn.Conv2d(
             self.embed_dims_2,
             self.embed_dims_2,
             kernel_size=7,
@@ -87,14 +94,42 @@ class MultiOrderDWConv(nn.Module):
             stride=1,
             dilation=dw_dilation[2],
         )
-        self.pw_conv = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
+        self.PW_conv = nn.Conv2d(embed_dims, embed_dims, kernel_size=1)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        for legacy_name, current_name in self._LEGACY_STATE_DICT_KEY_MAP.items():
+            legacy_prefix = f"{prefix}{legacy_name}."
+            current_prefix = f"{prefix}{current_name}."
+            for suffix in ("weight", "bias"):
+                legacy_key = f"{legacy_prefix}{suffix}"
+                current_key = f"{current_prefix}{suffix}"
+                if legacy_key in state_dict and current_key not in state_dict:
+                    state_dict[current_key] = state_dict.pop(legacy_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_0 = self.dw_conv0(x)
-        x_1 = self.dw_conv1(x_0[:, self.embed_dims_0 : self.embed_dims_0 + self.embed_dims_1, ...])
-        x_2 = self.dw_conv2(x_0[:, self.embed_dims - self.embed_dims_2 :, ...])
+        x_0 = self.DW_conv0(x)
+        x_1 = self.DW_conv1(x_0[:, self.embed_dims_0 : self.embed_dims_0 + self.embed_dims_1, ...])
+        x_2 = self.DW_conv2(x_0[:, self.embed_dims - self.embed_dims_2 :, ...])
         x = torch.cat([x_0[:, : self.embed_dims_0, ...], x_1, x_2], dim=1)
-        return self.pw_conv(x)
+        return self.PW_conv(x)
 
 
 class MultiOrderGatedAggregation(nn.Module):

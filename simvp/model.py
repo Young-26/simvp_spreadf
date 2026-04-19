@@ -236,6 +236,11 @@ class MogaSubBlock(nn.Module):
         )
         self.apply(self._init_weights)
 
+    def no_weight_decay(self):
+        # OpenSTL excludes these parameter names/keywords from weight decay.
+        # simvp_spreadf does not yet consume this helper when building optimizer param groups.
+        return {"layer_scale_1", "layer_scale_2", "sigma"}
+
     @staticmethod
     def _init_weights(module: nn.Module):
         if isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
@@ -267,6 +272,7 @@ class MetaBlock(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        model_type = normalize_simvp_model_type(model_type)
 
         if model_type == "gsta":
             self.block = GASubBlock(

@@ -614,6 +614,9 @@ def resolve_train_loss_mode(args, loss_weights=None):
 
 
 def build_optimizer(args, model):
+    # TODO: OpenSTL-style no_weight_decay keywords exposed by MogaSubBlock.no_weight_decay()
+    # are not yet wired into optimizer param groups here. The current training path still applies
+    # one global weight_decay to model.parameters() for both Adam and AdamW.
     if args.opt == "adam":
         return torch.optim.Adam(
             model.parameters(),

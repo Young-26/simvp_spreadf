@@ -1,7 +1,9 @@
 import unittest
+from collections import OrderedDict
 
 import torch
 
+from simvp.model import MetaBlock, SimVP
 from simvp.wrapper import SimVPForecast
 
 
@@ -38,6 +40,80 @@ class SimVPModelTypeTests(unittest.TestCase):
 
     def test_shape_and_backward_smoke_moga_alias(self):
         self._run_forward_and_backward("moga")
+
+    def test_direct_simvp_constructor_accepts_moga_alias(self):
+        model = SimVP(
+            shape_in=(8, 1, 64, 64),
+            hid_S=8,
+            hid_T=32,
+            N_S=4,
+            N_T=4,
+            model_type="moga",
+        )
+        x = torch.randn(1, 8, 1, 64, 64)
+        y = model(x)
+        self.assertEqual(tuple(y.shape), (1, 8, 1, 64, 64))
+
+    def test_metablock_accepts_moga_alias(self):
+        block = MetaBlock(
+            in_channels=32,
+            out_channels=32,
+            model_type="moga",
+            mlp_ratio=4.0,
+            drop=0.0,
+            drop_path=0.0,
+        )
+        x = torch.randn(2, 32, 8, 8)
+        y = block(x)
+        self.assertEqual(tuple(y.shape), (2, 32, 8, 8))
+
+    def test_moganet_state_dict_uses_openstl_key_names(self):
+        block = MetaBlock(
+            in_channels=32,
+            out_channels=32,
+            model_type="moga",
+            mlp_ratio=4.0,
+            drop=0.0,
+            drop_path=0.0,
+        )
+        keys = set(block.state_dict().keys())
+        self.assertIn("block.attn.value.DW_conv0.weight", keys)
+        self.assertIn("block.attn.value.DW_conv1.weight", keys)
+        self.assertIn("block.attn.value.DW_conv2.weight", keys)
+        self.assertIn("block.attn.value.PW_conv.weight", keys)
+        self.assertNotIn("block.attn.value.dw_conv0.weight", keys)
+        self.assertNotIn("block.attn.value.pw_conv.weight", keys)
+
+    def test_moganet_legacy_lowercase_state_dict_keys_still_load(self):
+        block = MetaBlock(
+            in_channels=32,
+            out_channels=32,
+            model_type="moga",
+            mlp_ratio=4.0,
+            drop=0.0,
+            drop_path=0.0,
+        )
+        legacy_state = OrderedDict()
+        for key, value in block.state_dict().items():
+            legacy_key = (
+                key.replace(".DW_conv0.", ".dw_conv0.")
+                .replace(".DW_conv1.", ".dw_conv1.")
+                .replace(".DW_conv2.", ".dw_conv2.")
+                .replace(".PW_conv.", ".pw_conv.")
+            )
+            legacy_state[legacy_key] = value.clone()
+
+        reloaded = MetaBlock(
+            in_channels=32,
+            out_channels=32,
+            model_type="moga",
+            mlp_ratio=4.0,
+            drop=0.0,
+            drop_path=0.0,
+        )
+        result = reloaded.load_state_dict(legacy_state, strict=True)
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
 
     def test_shape_and_backward_smoke_v2_alias(self):
         self._run_forward_and_backward("v2")
