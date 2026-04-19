@@ -26,7 +26,7 @@ from simvp.simvp_config import (
     SIMVP_OPENSTL_TRAIN_PRESET,
     SIMVP_RECIPE_CHOICES,
     get_effective_simvp_recipe,
-    is_simvp_gsta_openstl_recipe,
+    is_simvp_openstl_recipe,
     normalize_predrnnpp_recipe,
     normalize_simvp_model_type,
     normalize_simvp_recipe,
@@ -68,8 +68,8 @@ def uses_predrnnpp_openstl_recipe(args) -> bool:
     return is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "openstl"
 
 
-def uses_simvp_gsta_openstl_recipe(args) -> bool:
-    return is_simvp_gsta_openstl_recipe(
+def uses_simvp_openstl_recipe(args) -> bool:
+    return is_simvp_openstl_recipe(
         getattr(args, "arch", "simvp"),
         getattr(args, "simvp_model_type", "incepu"),
         getattr(args, "simvp_recipe", "auto"),
@@ -259,7 +259,7 @@ def apply_simvp_recipe_defaults(args, explicit_cli_args=None):
     args.simvp_recipe = get_simvp_recipe(args)
     args.predrnnpp_recipe = get_predrnnpp_recipe(args)
 
-    if not uses_simvp_gsta_openstl_recipe(args):
+    if not uses_simvp_openstl_recipe(args):
         return args
 
     for field, value in SIMVP_OPENSTL_TRAIN_PRESET.items():
@@ -532,7 +532,7 @@ def resolve_optimizer_config(args):
     args.simvp_recipe = get_simvp_recipe(args)
     opt = str(args.opt).lower()
     if opt == "auto":
-        opt = "adam" if uses_predrnnpp_openstl_recipe(args) or uses_simvp_gsta_openstl_recipe(args) or is_tau_arch(args) else "adamw"
+        opt = "adam" if uses_predrnnpp_openstl_recipe(args) or uses_simvp_openstl_recipe(args) or is_tau_arch(args) else "adamw"
     args.opt = opt
     return args
 
@@ -544,7 +544,7 @@ def resolve_scheduler_config(args):
     if args.sched == "auto":
         if uses_predrnnpp_openstl_recipe(args):
             args.sched = "onecycle"
-        elif uses_simvp_gsta_openstl_recipe(args):
+        elif uses_simvp_openstl_recipe(args):
             args.sched = "onecycle"
         elif is_tau_arch(args):
             args.sched = "cosine"
@@ -555,7 +555,7 @@ def resolve_scheduler_config(args):
     if (
         uses_weighted_reconstruction_loss(args)
         or uses_predrnnpp_openstl_recipe(args)
-        or uses_simvp_gsta_openstl_recipe(args)
+        or uses_simvp_openstl_recipe(args)
         or is_tau_arch(args)
     ):
         args.warmup_epoch = 0
@@ -1127,7 +1127,7 @@ def main():
                 f"simvp_recipe: {args.simvp_recipe}  "
                 f"resolved_simvp_recipe: {get_effective_simvp_recipe_from_args(args)}"
             )
-            if str(args.simvp_model_type).lower() == "gsta":
+            if uses_simvp_openstl_recipe(args):
                 logger.info(
                     f"simvp_spatio_kernel_enc: {args.simvp_spatio_kernel_enc}  "
                     f"simvp_spatio_kernel_dec: {args.simvp_spatio_kernel_dec}  "

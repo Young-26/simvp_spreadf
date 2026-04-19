@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 
-SIMVP_MODEL_TYPE_CHOICES = ("incepu", "gsta")
-SIMVP_MODEL_TYPE_ALIASES = ("incepu", "gsta", "v1", "v2", "simvpv1", "simvpv2")
+SIMVP_MODEL_TYPE_CHOICES = ("incepu", "gsta", "moganet")
+SIMVP_MODEL_TYPE_ALIASES = ("incepu", "gsta", "moga", "moganet", "v1", "v2", "simvpv1", "simvpv2")
 SIMVP_RECIPE_CHOICES = ("auto", "simvp", "openstl")
 PREDRNNPP_RECIPE_CHOICES = ("simvp", "openstl")
+SIMVP_OPENSTL_MODEL_TYPES = frozenset(("gsta", "moganet"))
 
 SIMVP_OPENSTL_TRAIN_PRESET = {
     "hid_S": 64,
@@ -23,6 +24,8 @@ SIMVP_OPENSTL_TRAIN_PRESET = {
 _SIMVP_MODEL_TYPE_ALIAS_MAP = {
     "incepu": "incepu",
     "gsta": "gsta",
+    "moga": "moganet",
+    "moganet": "moganet",
     "v1": "incepu",
     "simvpv1": "incepu",
     "v2": "gsta",
@@ -78,8 +81,22 @@ def get_effective_simvp_recipe(
     if normalized_arch != "simvp":
         return normalized_recipe
     if normalized_recipe == "auto":
-        return "openstl" if normalized_model_type == "gsta" else "simvp"
+        return "openstl" if normalized_model_type in SIMVP_OPENSTL_MODEL_TYPES else "simvp"
     return normalized_recipe
+
+
+def is_simvp_openstl_recipe(
+    arch: Optional[str],
+    model_type: Optional[str],
+    recipe: Optional[str],
+) -> bool:
+    normalized_arch = str("simvp" if arch is None else arch).strip().lower()
+    normalized_model_type = normalize_simvp_model_type(model_type)
+    return (
+        normalized_arch == "simvp"
+        and normalized_model_type in SIMVP_OPENSTL_MODEL_TYPES
+        and get_effective_simvp_recipe(normalized_arch, normalized_model_type, recipe) == "openstl"
+    )
 
 
 def is_simvp_gsta_openstl_recipe(

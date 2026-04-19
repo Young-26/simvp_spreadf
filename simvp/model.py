@@ -3,6 +3,7 @@ import math
 import torch
 from torch import nn
 
+from .moganet_layers import ChannelAggregationFFN, MultiOrderGatedAggregation
 from .modules import ConvSC, Inception
 from .simvp_config import normalize_simvp_model_type
 from .tau_model import Decoder as MetaDecoder
@@ -197,6 +198,62 @@ class GASubBlock(nn.Module):
         return x
 
 
+class MogaSubBlock(nn.Module):
+    def __init__(
+        self,
+        embed_dims,
+        mlp_ratio=4.0,
+        drop_rate=0.0,
+        drop_path_rate=0.0,
+        init_value=1e-5,
+        attn_dw_dilation=(1, 2, 3),
+        attn_channel_split=(1, 3, 4),
+    ):
+        super().__init__()
+        self.norm1 = nn.BatchNorm2d(embed_dims)
+        self.attn = MultiOrderGatedAggregation(
+            embed_dims,
+            attn_dw_dilation=attn_dw_dilation,
+            attn_channel_split=attn_channel_split,
+        )
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+
+        self.norm2 = nn.BatchNorm2d(embed_dims)
+        mlp_hidden_dims = int(embed_dims * mlp_ratio)
+        self.mlp = ChannelAggregationFFN(
+            embed_dims=embed_dims,
+            mlp_hidden_dims=mlp_hidden_dims,
+            ffn_drop=drop_rate,
+        )
+
+        self.layer_scale_1 = nn.Parameter(
+            init_value * torch.ones((1, embed_dims, 1, 1)),
+            requires_grad=True,
+        )
+        self.layer_scale_2 = nn.Parameter(
+            init_value * torch.ones((1, embed_dims, 1, 1)),
+            requires_grad=True,
+        )
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module):
+        if isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+        elif isinstance(module, nn.Conv2d):
+            fan_out = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
+            fan_out //= module.groups
+            module.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, x):
+        x = x + self.drop_path(self.layer_scale_1 * self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.layer_scale_2 * self.mlp(self.norm2(x)))
+        return x
+
+
 class MetaBlock(nn.Module):
     def __init__(
         self,
@@ -211,19 +268,27 @@ class MetaBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        if model_type != "gsta":
-            raise ValueError(
-                f"Unsupported SimVP MetaBlock model_type '{model_type}'. Only 'gsta' is implemented."
+        if model_type == "gsta":
+            self.block = GASubBlock(
+                in_channels,
+                kernel_size=21,
+                mlp_ratio=mlp_ratio,
+                drop=drop,
+                drop_path=drop_path,
+                act_layer=nn.GELU,
             )
-
-        self.block = GASubBlock(
-            in_channels,
-            kernel_size=21,
-            mlp_ratio=mlp_ratio,
-            drop=drop,
-            drop_path=drop_path,
-            act_layer=nn.GELU,
-        )
+        elif model_type == "moganet":
+            self.block = MogaSubBlock(
+                in_channels,
+                mlp_ratio=mlp_ratio,
+                drop_rate=drop,
+                drop_path_rate=drop_path,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported SimVP MetaBlock model_type '{model_type}'. "
+                "Implemented metaformer choices: ('gsta', 'moganet')."
+            )
         self.reduction = None
         if in_channels != out_channels:
             self.reduction = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
@@ -319,7 +384,7 @@ class SimVP(nn.Module):
             self.enc = Encoder(C, hid_S, N_S)
             self.hid = Mid_Xnet(T * hid_S, hid_T, N_T, incep_ker, groups)
             self.dec = Decoder(hid_S, C, N_S)
-        elif model_type == "gsta":
+        elif model_type in ("gsta", "moganet"):
             act_inplace = False
             self.enc = MetaEncoder(
                 C,
@@ -346,7 +411,7 @@ class SimVP(nn.Module):
             )
         else:
             raise ValueError(
-                f"Unsupported SimVP model_type '{model_type}'. Available choices: ('incepu', 'gsta')."
+                f"Unsupported SimVP model_type '{model_type}'. Available choices: ('incepu', 'gsta', 'moganet')."
             )
 
     def forward(self, x_raw):

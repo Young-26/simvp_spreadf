@@ -14,6 +14,7 @@ from simvp.simvp_config import (
     SIMVP_OPENSTL_TRAIN_PRESET,
     SIMVP_RECIPE_CHOICES,
     get_effective_simvp_recipe,
+    is_simvp_openstl_recipe,
     normalize_simvp_model_type,
 )
 from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
@@ -51,6 +52,8 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(normalize_simvp_model_type(None), "incepu")
         self.assertEqual(normalize_simvp_model_type("incepu"), "incepu")
         self.assertEqual(normalize_simvp_model_type("gsta"), "gsta")
+        self.assertEqual(normalize_simvp_model_type("moga"), "moganet")
+        self.assertEqual(normalize_simvp_model_type("moganet"), "moganet")
         self.assertEqual(normalize_simvp_model_type("v1"), "incepu")
         self.assertEqual(normalize_simvp_model_type("simvpv1"), "incepu")
         self.assertEqual(normalize_simvp_model_type("v2"), "gsta")
@@ -97,6 +100,18 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(train_args.simvp_model_type, "simvpv2")
         self.assertEqual(infer_args.simvp_model_type, "v2")
 
+        moga_args = infer_lib.parse_args(
+            [
+                "--manifest",
+                "val.jsonl",
+                "--checkpoint",
+                "best.ckpt",
+                "--simvp_model_type",
+                "moga",
+            ]
+        )
+        self.assertEqual(moga_args.simvp_model_type, "moga")
+
     def test_infer_parser_rejects_invalid_model_type(self):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -129,6 +144,25 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(args.lr, SIMVP_OPENSTL_TRAIN_PRESET["lr"])
         self.assertEqual(args.batch_size, SIMVP_OPENSTL_TRAIN_PRESET["batch_size"])
         self.assertEqual(args.simvp_drop_path, SIMVP_OPENSTL_TRAIN_PRESET["simvp_drop_path"])
+        self.assertEqual(args.warmup_epoch, 0)
+
+    def test_simvp_moganet_openstl_recipe_resolves_auto_optimizer_scheduler(self):
+        args = self._make_train_args(simvp_model_type="moga", simvp_recipe="auto")
+        args = train_lib.apply_simvp_recipe_defaults(args, explicit_cli_args=set())
+        args = train_lib.resolve_optimizer_config(args)
+        args = train_lib.resolve_scheduler_config(args)
+
+        self.assertEqual(args.simvp_model_type, "moganet")
+        self.assertEqual(get_effective_simvp_recipe(args.arch, args.simvp_model_type, args.simvp_recipe), "openstl")
+        self.assertTrue(is_simvp_openstl_recipe(args.arch, args.simvp_model_type, args.simvp_recipe))
+        self.assertEqual(args.opt, "adam")
+        self.assertEqual(args.sched, "onecycle")
+        self.assertEqual(args.hid_S, SIMVP_OPENSTL_TRAIN_PRESET["hid_S"])
+        self.assertEqual(args.hid_T, SIMVP_OPENSTL_TRAIN_PRESET["hid_T"])
+        self.assertEqual(args.N_S, SIMVP_OPENSTL_TRAIN_PRESET["N_S"])
+        self.assertEqual(args.N_T, SIMVP_OPENSTL_TRAIN_PRESET["N_T"])
+        self.assertEqual(args.lr, SIMVP_OPENSTL_TRAIN_PRESET["lr"])
+        self.assertEqual(args.batch_size, SIMVP_OPENSTL_TRAIN_PRESET["batch_size"])
         self.assertEqual(args.warmup_epoch, 0)
 
     def test_explicit_simvp_recipe_overrides_take_priority(self):
@@ -213,7 +247,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(tuple(predict_model(x).shape), (1, 2, 1, 64, 64))
 
     def test_canonical_choices_remain_small_and_stable(self):
-        self.assertEqual(SIMVP_MODEL_TYPE_CHOICES, ("incepu", "gsta"))
+        self.assertEqual(SIMVP_MODEL_TYPE_CHOICES, ("incepu", "gsta", "moganet"))
 
 
 if __name__ == "__main__":

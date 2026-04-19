@@ -33,6 +33,12 @@ class SimVPModelTypeTests(unittest.TestCase):
     def test_shape_and_backward_smoke_gsta(self):
         self._run_forward_and_backward("gsta")
 
+    def test_shape_and_backward_smoke_moganet(self):
+        self._run_forward_and_backward("moganet")
+
+    def test_shape_and_backward_smoke_moga_alias(self):
+        self._run_forward_and_backward("moga")
+
     def test_shape_and_backward_smoke_v2_alias(self):
         self._run_forward_and_backward("v2")
 
