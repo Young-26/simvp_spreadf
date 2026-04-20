@@ -35,6 +35,7 @@ class SimVPConfigTests(unittest.TestCase):
             simvp_model_type="gsta",
             simvp_recipe="openstl",
             predrnnpp_recipe="simvp",
+            predformer_loss="mae",
             opt="auto",
             sched="auto",
             warmup_epoch=3,
@@ -72,6 +73,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(_get_action_choices(train_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(infer_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(predict_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
+        self.assertEqual(_get_action_choices(train_lib.build_parser(), "predformer_loss"), ("mae", "mse"))
 
     def test_train_and_infer_parsers_accept_aliases(self):
         train_args = train_lib.parse_args(
@@ -166,14 +168,14 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(args.batch_size, SIMVP_OPENSTL_TRAIN_PRESET["batch_size"])
         self.assertEqual(args.warmup_epoch, 0)
 
-    def test_simvp_moganet_openstl_recipe_uses_mse_openstl_loss_mode(self):
+    def test_simvp_moganet_openstl_recipe_uses_mae_openstl_loss_mode(self):
         args = self._make_train_args(simvp_model_type="moga", simvp_recipe="openstl")
         args = train_lib.apply_simvp_recipe_defaults(args, explicit_cli_args=set())
 
         self.assertEqual(args.simvp_model_type, "moganet")
         self.assertTrue(train_lib.uses_simvp_moganet_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
-        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
 
     def test_simvp_gsta_openstl_recipe_keeps_local_reconstruction_loss_mode(self):
         args = self._make_train_args(simvp_model_type="gsta", simvp_recipe="openstl")
@@ -187,6 +189,25 @@ class SimVPConfigTests(unittest.TestCase):
         args = self._make_train_args(arch="earthfarseer", simvp_model_type="gsta", simvp_recipe="openstl")
 
         self.assertTrue(train_lib.uses_earthfarseer_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+
+    def test_predformer_facts_uses_mae_openstl_loss_mode(self):
+        args = self._make_train_args(arch="predformer_facts", simvp_model_type="gsta", simvp_recipe="openstl")
+
+        self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
+
+    def test_predformer_facts_supports_mse_openstl_loss_mode(self):
+        args = self._make_train_args(
+            arch="predformer_facts",
+            simvp_model_type="gsta",
+            simvp_recipe="openstl",
+            predformer_loss="mse",
+        )
+
+        self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
         self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
 
