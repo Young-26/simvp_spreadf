@@ -165,6 +165,30 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(args.batch_size, SIMVP_OPENSTL_TRAIN_PRESET["batch_size"])
         self.assertEqual(args.warmup_epoch, 0)
 
+    def test_simvp_moganet_openstl_recipe_uses_mse_openstl_loss_mode(self):
+        args = self._make_train_args(simvp_model_type="moga", simvp_recipe="openstl")
+        args = train_lib.apply_simvp_recipe_defaults(args, explicit_cli_args=set())
+
+        self.assertEqual(args.simvp_model_type, "moganet")
+        self.assertTrue(train_lib.uses_simvp_moganet_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+
+    def test_simvp_gsta_openstl_recipe_keeps_local_reconstruction_loss_mode(self):
+        args = self._make_train_args(simvp_model_type="gsta", simvp_recipe="openstl")
+        args = train_lib.apply_simvp_recipe_defaults(args, explicit_cli_args=set())
+
+        self.assertFalse(train_lib.uses_simvp_moganet_openstl_loss(args))
+        self.assertTrue(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "lambda_global*global_l1 + lambda_local*local_l1")
+
+    def test_earthfarseer_uses_mse_openstl_loss_mode(self):
+        args = self._make_train_args(arch="earthfarseer", simvp_model_type="gsta", simvp_recipe="openstl")
+
+        self.assertTrue(train_lib.uses_earthfarseer_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+
     def test_explicit_simvp_recipe_overrides_take_priority(self):
         args = self._make_train_args(
             simvp_model_type="simvpv2",

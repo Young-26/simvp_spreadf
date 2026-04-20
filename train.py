@@ -76,6 +76,20 @@ def uses_simvp_openstl_recipe(args) -> bool:
     )
 
 
+def uses_simvp_moganet_openstl_loss(args) -> bool:
+    return (
+        str(getattr(args, "arch", "simvp")).lower() == "simvp"
+        and get_simvp_model_type(args) == "moganet"
+        and get_effective_simvp_recipe_from_args(args) == "openstl"
+    )
+
+
+def uses_earthfarseer_openstl_loss(args) -> bool:
+    # EarthFarseer only reuses the OpenSTL-style MSE objective; it does not
+    # consume PredRNN++'s full-sequence/mask_true training interface.
+    return str(getattr(args, "arch", "simvp")).lower() == "earthfarseer"
+
+
 def uses_weighted_reconstruction_loss(args) -> bool:
     arch = str(args.arch).lower()
     return arch == "convlstm" or (is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "simvp")
@@ -83,6 +97,9 @@ def uses_weighted_reconstruction_loss(args) -> bool:
 
 def uses_local_reconstruction_loss(args) -> bool:
     return (
+        not uses_simvp_moganet_openstl_loss(args)
+        and not uses_earthfarseer_openstl_loss(args)
+        and
         not uses_weighted_reconstruction_loss(args)
         and not uses_predrnnpp_openstl_recipe(args)
         and not is_tau_arch(args)
@@ -597,6 +614,10 @@ def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, log
 
 def resolve_train_loss_mode(args, loss_weights=None):
     if uses_predrnnpp_openstl_recipe(args):
+        return "mse_openstl"
+    if uses_simvp_moganet_openstl_loss(args):
+        return "mse_openstl"
+    if uses_earthfarseer_openstl_loss(args):
         return "mse_openstl"
     if is_tau_arch(args):
         if int(args.out_T) <= 2:
@@ -1458,6 +1479,10 @@ def main():
                         y.float(),
                     )
                     loss = loss_mse + float(args.tau_alpha) * loss_diff_div
+                elif uses_simvp_moganet_openstl_loss(args) or uses_earthfarseer_openstl_loss(args):
+                    loss_perceptual = pred.new_zeros(())
+                    loss_diff_div = pred.new_zeros(())
+                    loss = loss_mse
                 else:
                     loss_perceptual = pred.new_zeros(())
                     loss_diff_div = pred.new_zeros(())
@@ -1504,6 +1529,11 @@ def main():
                             loss=f"{loss.item():.6f}",
                             mse=f"{loss_mse.item():.6f}",
                             diff_div=f"{loss_diff_div.item():.6f}",
+                        )
+                    elif uses_simvp_moganet_openstl_loss(args) or uses_earthfarseer_openstl_loss(args):
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
                         )
                     else:
                         iterator.set_postfix(
@@ -1656,6 +1686,11 @@ def main():
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
                         f"train_diff_div: {train_diff_div:.4f}  tau_alpha: {args.tau_alpha:.4f}"
+                    )
+                elif uses_simvp_moganet_openstl_loss(args) or uses_earthfarseer_openstl_loss(args):
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
+                        f"arch: {args.arch}"
                     )
                 else:
                     logger.info(
