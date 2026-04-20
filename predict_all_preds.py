@@ -80,14 +80,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simvp_recipe", type=str, default=None, choices=SIMVP_RECIPE_CHOICES)
     parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=PREDRNNPP_RECIPE_CHOICES)
     parser.add_argument("--predformer_patch_size", type=int, default=None)
-    parser.add_argument("--predformer_dim", type=int, default=None)
+    parser.add_argument("--predformer_dim", type=int, default=None, help="PredFormer_FacTS embedding dim. Odd values are supported.")
     parser.add_argument("--predformer_heads", type=int, default=None)
     parser.add_argument("--predformer_dim_head", type=int, default=None)
     parser.add_argument("--predformer_dropout", type=float, default=None)
     parser.add_argument("--predformer_attn_dropout", type=float, default=None)
     parser.add_argument("--predformer_drop_path", type=float, default=None)
     parser.add_argument("--predformer_scale_dim", type=int, default=None)
-    parser.add_argument("--predformer_depth", type=int, default=None)
+    parser.add_argument(
+        "--predformer_depth",
+        type=int,
+        default=None,
+        help="Shared transformer stack depth for the FacTS port; the same depth is used for both temporal and spatial branches.",
+    )
     parser.add_argument("--image_mode", type=str, default=None, choices=["L", "RGB"])
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--in_T", type=int, default=None)

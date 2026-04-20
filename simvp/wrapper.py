@@ -198,6 +198,8 @@ class SimVPForecast(nn.Module):
                 reverse_scheduled_sampling=predrnnpp_reverse_scheduled_sampling,
             )
         elif self.arch == "predformer_facts":
+            # predformer_depth remains the external config name for compatibility. In this
+            # FacTS port it controls the shared stack depth used by both transformer branches.
             self.backbone = PredFormerFacTS_Model(
                 shape_in=(in_T, C, H, W),
                 patch_size=predformer_patch_size,

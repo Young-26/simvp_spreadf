@@ -281,7 +281,7 @@ class SimVPConfigTests(unittest.TestCase):
                 "in_T": 4,
                 "out_T": 2,
                 "predformer_patch_size": 8,
-                "predformer_dim": 64,
+                "predformer_dim": 65,
                 "predformer_heads": 4,
                 "predformer_dim_head": 16,
                 "predformer_dropout": 0.1,
@@ -295,7 +295,7 @@ class SimVPConfigTests(unittest.TestCase):
         )
         self.assertEqual(metadata["arch"], "predformer_facts")
         self.assertEqual(model_kwargs["predformer_patch_size"], 8)
-        self.assertEqual(model_kwargs["predformer_dim"], 64)
+        self.assertEqual(model_kwargs["predformer_dim"], 65)
         self.assertEqual(model_kwargs["predformer_heads"], 4)
         self.assertEqual(model_kwargs["predformer_dim_head"], 16)
         self.assertEqual(model_kwargs["predformer_dropout"], 0.1)
@@ -315,14 +315,14 @@ class SimVPConfigTests(unittest.TestCase):
             image_size=32,
             overrides={
                 "predformer_patch_size": 8,
-                "predformer_dim": 64,
+                "predformer_dim": 65,
                 "predformer_heads": 4,
                 "predformer_dim_head": 16,
                 "predformer_depth": 2,
             },
         )
         self.assertEqual(model_kwargs["predformer_patch_size"], 8)
-        self.assertEqual(model_kwargs["predformer_dim"], 64)
+        self.assertEqual(model_kwargs["predformer_dim"], 65)
         self.assertEqual(model_kwargs["predformer_heads"], 4)
         self.assertEqual(model_kwargs["predformer_dim_head"], 16)
         self.assertEqual(model_kwargs["predformer_depth"], 2)

@@ -1,7 +1,19 @@
+import math
+
 import torch
 from torch import nn
 
 from .tau_model import DropPath
+
+
+def _init_linear_and_layernorm(module: nn.Module):
+    if isinstance(module, nn.Linear):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+    elif isinstance(module, nn.LayerNorm):
+        nn.init.constant_(module.bias, 0)
+        nn.init.constant_(module.weight, 1.0)
 
 
 class PreNorm(nn.Module):
@@ -88,17 +100,6 @@ class GatedTransformer(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(dim)
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(module: nn.Module):
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.constant_(module.bias, 0)
-            nn.init.constant_(module.weight, 1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for attn, ff, drop_path1, drop_path2 in self.layers:
@@ -109,10 +110,10 @@ class GatedTransformer(nn.Module):
 
 def sinusoidal_embedding(num_positions: int, dim: int) -> torch.Tensor:
     position = torch.arange(num_positions, dtype=torch.float32).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-torch.log(torch.tensor(10000.0)) / dim))
+    div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim))
     pe = torch.zeros(1, num_positions, dim, dtype=torch.float32)
     pe[0, :, 0::2] = torch.sin(position * div_term)
-    pe[0, :, 1::2] = torch.cos(position * div_term)
+    pe[0, :, 1::2] = torch.cos(position * div_term[: pe[0, :, 1::2].shape[-1]])
     return pe
 
 
@@ -135,6 +136,8 @@ class PatchEmbed(nn.Module):
 
 
 class PredFormerFacTS_Model(nn.Module):
+    """PredFormer FacTS port with a shared transformer depth for temporal and spatial stacks."""
+
     def __init__(
         self,
         shape_in,
@@ -167,15 +170,18 @@ class PredFormerFacTS_Model(nn.Module):
 
         self.to_patch_embedding = PatchEmbed(self.channels, self.patch_size, self.dim)
         pos_embedding = sinusoidal_embedding(self.steps * self.num_patches, self.dim)
-        self.pos_embedding = nn.Parameter(
+        self.register_buffer(
+            "pos_embedding",
             pos_embedding.view(1, self.steps, self.num_patches, self.dim),
-            requires_grad=False,
         )
 
+        # Keep the public predformer_depth setting compatible with existing CLI/config usage.
+        # In this FacTS port it is a shared stack depth used by both transformer branches.
+        shared_depth = int(depth)
         mlp_dim = self.dim * int(scale_dim)
         self.temporal_transformer = GatedTransformer(
             self.dim,
-            depth=depth,
+            depth=shared_depth,
             heads=heads,
             dim_head=dim_head,
             mlp_dim=mlp_dim,
@@ -185,7 +191,7 @@ class PredFormerFacTS_Model(nn.Module):
         )
         self.spatial_transformer = GatedTransformer(
             self.dim,
-            depth=depth,
+            depth=shared_depth,
             heads=heads,
             dim_head=dim_head,
             mlp_dim=mlp_dim,
@@ -197,17 +203,7 @@ class PredFormerFacTS_Model(nn.Module):
             nn.LayerNorm(self.dim),
             nn.Linear(self.dim, self.channels * self.patch_size * self.patch_size),
         )
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(module: nn.Module):
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.constant_(module.bias, 0)
-            nn.init.constant_(module.weight, 1.0)
+        self.apply(_init_linear_and_layernorm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, steps, channels, height, width = x.shape
@@ -220,7 +216,12 @@ class PredFormerFacTS_Model(nn.Module):
             )
 
         x = self.to_patch_embedding(x)
-        x = x + self.pos_embedding.to(device=x.device, dtype=x.dtype)
+        pos_embedding = self.pos_embedding
+        if pos_embedding.dtype != x.dtype:
+            # The buffer already tracks device with the module; only align dtype under AMP to avoid
+            # promoting activations back to fp32 during the addition.
+            pos_embedding = pos_embedding.to(dtype=x.dtype)
+        x = x + pos_embedding
 
         x_t = x.permute(0, 2, 1, 3).contiguous().view(batch_size * self.num_patches, steps, self.dim)
         x_t = self.temporal_transformer(x_t)

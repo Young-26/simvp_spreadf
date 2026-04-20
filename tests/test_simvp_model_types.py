@@ -1,9 +1,11 @@
+import io
 import unittest
 from collections import OrderedDict
 
 import torch
 
 from simvp.model import MetaBlock, SimVP
+from simvp.predformer_facts_model import PredFormerFacTS_Model
 from simvp.wrapper import SimVPForecast
 
 
@@ -153,6 +155,24 @@ class SimVPModelTypeTests(unittest.TestCase):
         y.square().mean().backward()
         self.assertTrue(any(param.grad is not None for param in model.parameters() if param.requires_grad))
 
+    def test_predformer_facts_supports_odd_predformer_dim(self):
+        model = SimVPForecast(
+            in_T=4,
+            out_T=2,
+            C=1,
+            H=32,
+            W=32,
+            arch="predformer_facts",
+            predformer_patch_size=8,
+            predformer_dim=65,
+            predformer_heads=5,
+            predformer_dim_head=13,
+            predformer_depth=1,
+        )
+        x = torch.randn(1, 4, 1, 32, 32)
+        y = model(x)
+        self.assertEqual(tuple(y.shape), (1, 2, 1, 32, 32))
+
     def test_predformer_facts_autoregressive_rollout_supports_out_t_gt_in_t(self):
         model = SimVPForecast(
             in_T=4,
@@ -170,6 +190,54 @@ class SimVPModelTypeTests(unittest.TestCase):
         x = torch.randn(1, 4, 1, 32, 32)
         y = model(x)
         self.assertEqual(tuple(y.shape), (1, 6, 1, 32, 32))
+
+    def test_predformer_facts_position_embedding_is_buffer_not_trainable_parameter(self):
+        model = PredFormerFacTS_Model(
+            shape_in=(4, 1, 32, 32),
+            patch_size=8,
+            dim=65,
+            heads=5,
+            dim_head=13,
+            depth=1,
+        )
+        self.assertIn("pos_embedding", model.state_dict())
+        self.assertIn("pos_embedding", dict(model.named_buffers()))
+        self.assertNotIn("pos_embedding", dict(model.named_parameters()))
+
+    def test_predformer_facts_state_dict_round_trip_preserves_buffer_and_forward(self):
+        model = PredFormerFacTS_Model(
+            shape_in=(4, 1, 32, 32),
+            patch_size=8,
+            dim=65,
+            heads=5,
+            dim_head=13,
+            depth=1,
+        )
+        model.eval()
+        x = torch.randn(1, 4, 1, 32, 32)
+        y = model(x)
+
+        buffer = io.BytesIO()
+        torch.save(model.state_dict(), buffer)
+        buffer.seek(0)
+        reloaded_state = torch.load(buffer, map_location="cpu", weights_only=False)
+
+        reloaded = PredFormerFacTS_Model(
+            shape_in=(4, 1, 32, 32),
+            patch_size=8,
+            dim=65,
+            heads=5,
+            dim_head=13,
+            depth=1,
+        )
+        load_result = reloaded.load_state_dict(reloaded_state, strict=True)
+        self.assertEqual(load_result.missing_keys, [])
+        self.assertEqual(load_result.unexpected_keys, [])
+        self.assertIn("pos_embedding", dict(reloaded.named_buffers()))
+
+        reloaded.eval()
+        y_reloaded = reloaded(x)
+        torch.testing.assert_close(y, y_reloaded)
 
 
 if __name__ == "__main__":

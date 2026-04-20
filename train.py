@@ -177,14 +177,19 @@ def build_parser():
     parser.add_argument("--r_sampling_step_2", type=int, default=50000)
     parser.add_argument("--r_exp_alpha", type=float, default=5000.0)
     parser.add_argument("--predformer_patch_size", type=int, default=16)
-    parser.add_argument("--predformer_dim", type=int, default=256)
+    parser.add_argument("--predformer_dim", type=int, default=256, help="PredFormer_FacTS embedding dim. Odd values are supported.")
     parser.add_argument("--predformer_heads", type=int, default=8)
     parser.add_argument("--predformer_dim_head", type=int, default=32)
     parser.add_argument("--predformer_dropout", type=float, default=0.0)
     parser.add_argument("--predformer_attn_dropout", type=float, default=0.0)
     parser.add_argument("--predformer_drop_path", type=float, default=0.0)
     parser.add_argument("--predformer_scale_dim", type=int, default=4)
-    parser.add_argument("--predformer_depth", type=int, default=4)
+    parser.add_argument(
+        "--predformer_depth",
+        type=int,
+        default=4,
+        help="Shared transformer stack depth for the FacTS port; the same depth is used for both temporal and spatial branches.",
+    )
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
