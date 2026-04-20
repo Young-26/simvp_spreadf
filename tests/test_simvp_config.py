@@ -13,6 +13,7 @@ from simvp.simvp_config import (
     SIMVP_MODEL_TYPE_CHOICES,
     SIMVP_OPENSTL_TRAIN_PRESET,
     SIMVP_RECIPE_CHOICES,
+    build_forecast_model_kwargs_from_config,
     get_effective_simvp_recipe,
     is_simvp_openstl_recipe,
     normalize_simvp_model_type,
@@ -272,6 +273,59 @@ class SimVPConfigTests(unittest.TestCase):
 
     def test_canonical_choices_remain_small_and_stable(self):
         self.assertEqual(SIMVP_MODEL_TYPE_CHOICES, ("incepu", "gsta", "moganet"))
+
+    def test_build_forecast_model_kwargs_includes_predformer_facts_fields(self):
+        model_kwargs, metadata = build_forecast_model_kwargs_from_config(
+            {
+                "arch": "predformer_facts",
+                "in_T": 4,
+                "out_T": 2,
+                "predformer_patch_size": 8,
+                "predformer_dim": 64,
+                "predformer_heads": 4,
+                "predformer_dim_head": 16,
+                "predformer_dropout": 0.1,
+                "predformer_attn_dropout": 0.2,
+                "predformer_drop_path": 0.3,
+                "predformer_scale_dim": 2,
+                "predformer_depth": 3,
+            },
+            image_mode="L",
+            image_size=32,
+        )
+        self.assertEqual(metadata["arch"], "predformer_facts")
+        self.assertEqual(model_kwargs["predformer_patch_size"], 8)
+        self.assertEqual(model_kwargs["predformer_dim"], 64)
+        self.assertEqual(model_kwargs["predformer_heads"], 4)
+        self.assertEqual(model_kwargs["predformer_dim_head"], 16)
+        self.assertEqual(model_kwargs["predformer_dropout"], 0.1)
+        self.assertEqual(model_kwargs["predformer_attn_dropout"], 0.2)
+        self.assertEqual(model_kwargs["predformer_drop_path"], 0.3)
+        self.assertEqual(model_kwargs["predformer_scale_dim"], 2)
+        self.assertEqual(model_kwargs["predformer_depth"], 3)
+
+    def test_build_forecast_model_kwargs_allows_predformer_cli_overrides(self):
+        model_kwargs, _ = build_forecast_model_kwargs_from_config(
+            {
+                "arch": "predformer_facts",
+                "predformer_patch_size": 16,
+                "predformer_dim": 256,
+            },
+            image_mode="L",
+            image_size=32,
+            overrides={
+                "predformer_patch_size": 8,
+                "predformer_dim": 64,
+                "predformer_heads": 4,
+                "predformer_dim_head": 16,
+                "predformer_depth": 2,
+            },
+        )
+        self.assertEqual(model_kwargs["predformer_patch_size"], 8)
+        self.assertEqual(model_kwargs["predformer_dim"], 64)
+        self.assertEqual(model_kwargs["predformer_heads"], 4)
+        self.assertEqual(model_kwargs["predformer_dim_head"], 16)
+        self.assertEqual(model_kwargs["predformer_depth"], 2)
 
 
 if __name__ == "__main__":

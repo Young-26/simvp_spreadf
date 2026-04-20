@@ -79,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simvp_model_type", type=str, default=None, choices=SIMVP_MODEL_TYPE_ALIASES)
     parser.add_argument("--simvp_recipe", type=str, default=None, choices=SIMVP_RECIPE_CHOICES)
     parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=PREDRNNPP_RECIPE_CHOICES)
+    parser.add_argument("--predformer_patch_size", type=int, default=None)
+    parser.add_argument("--predformer_dim", type=int, default=None)
+    parser.add_argument("--predformer_heads", type=int, default=None)
+    parser.add_argument("--predformer_dim_head", type=int, default=None)
+    parser.add_argument("--predformer_dropout", type=float, default=None)
+    parser.add_argument("--predformer_attn_dropout", type=float, default=None)
+    parser.add_argument("--predformer_drop_path", type=float, default=None)
+    parser.add_argument("--predformer_scale_dim", type=int, default=None)
+    parser.add_argument("--predformer_depth", type=int, default=None)
     parser.add_argument("--image_mode", type=str, default=None, choices=["L", "RGB"])
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--in_T", type=int, default=None)
@@ -675,6 +684,15 @@ def main() -> None:
         "simvp_model_type": args.simvp_model_type,
         "simvp_recipe": args.simvp_recipe,
         "predrnnpp_recipe": args.predrnnpp_recipe,
+        "predformer_patch_size": args.predformer_patch_size,
+        "predformer_dim": args.predformer_dim,
+        "predformer_heads": args.predformer_heads,
+        "predformer_dim_head": args.predformer_dim_head,
+        "predformer_dropout": args.predformer_dropout,
+        "predformer_attn_dropout": args.predformer_attn_dropout,
+        "predformer_drop_path": args.predformer_drop_path,
+        "predformer_scale_dim": args.predformer_scale_dim,
+        "predformer_depth": args.predformer_depth,
         "use_local_branch": args.use_local_branch,
         "local_top": args.local_top,
         "local_bottom": args.local_bottom,

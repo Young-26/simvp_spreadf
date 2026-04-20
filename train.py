@@ -90,6 +90,11 @@ def uses_earthfarseer_openstl_loss(args) -> bool:
     return str(getattr(args, "arch", "simvp")).lower() == "earthfarseer"
 
 
+def uses_predformer_facts_openstl_loss(args) -> bool:
+    # PredFormer_FacTS follows the OpenSTL reference training objective: plain MSE on predictions.
+    return str(getattr(args, "arch", "simvp")).lower() == "predformer_facts"
+
+
 def uses_weighted_reconstruction_loss(args) -> bool:
     arch = str(args.arch).lower()
     return arch == "convlstm" or (is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "simvp")
@@ -99,6 +104,7 @@ def uses_local_reconstruction_loss(args) -> bool:
     return (
         not uses_simvp_moganet_openstl_loss(args)
         and not uses_earthfarseer_openstl_loss(args)
+        and not uses_predformer_facts_openstl_loss(args)
         and
         not uses_weighted_reconstruction_loss(args)
         and not uses_predrnnpp_openstl_recipe(args)
@@ -170,6 +176,15 @@ def build_parser():
     parser.add_argument("--r_sampling_step_1", type=int, default=25000)
     parser.add_argument("--r_sampling_step_2", type=int, default=50000)
     parser.add_argument("--r_exp_alpha", type=float, default=5000.0)
+    parser.add_argument("--predformer_patch_size", type=int, default=16)
+    parser.add_argument("--predformer_dim", type=int, default=256)
+    parser.add_argument("--predformer_heads", type=int, default=8)
+    parser.add_argument("--predformer_dim_head", type=int, default=32)
+    parser.add_argument("--predformer_dropout", type=float, default=0.0)
+    parser.add_argument("--predformer_attn_dropout", type=float, default=0.0)
+    parser.add_argument("--predformer_drop_path", type=float, default=0.0)
+    parser.add_argument("--predformer_scale_dim", type=int, default=4)
+    parser.add_argument("--predformer_depth", type=int, default=4)
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
     parser.add_argument("--arch", type=str, default="simvp", choices=SUPPORTED_ARCHS)
@@ -549,7 +564,14 @@ def resolve_optimizer_config(args):
     args.simvp_recipe = get_simvp_recipe(args)
     opt = str(args.opt).lower()
     if opt == "auto":
-        opt = "adam" if uses_predrnnpp_openstl_recipe(args) or uses_simvp_openstl_recipe(args) or is_tau_arch(args) else "adamw"
+        opt = (
+            "adam"
+            if uses_predrnnpp_openstl_recipe(args)
+            or uses_simvp_openstl_recipe(args)
+            or is_tau_arch(args)
+            or uses_predformer_facts_openstl_loss(args)
+            else "adamw"
+        )
     args.opt = opt
     return args
 
@@ -563,6 +585,8 @@ def resolve_scheduler_config(args):
             args.sched = "onecycle"
         elif uses_simvp_openstl_recipe(args):
             args.sched = "onecycle"
+        elif uses_predformer_facts_openstl_loss(args):
+            args.sched = "onecycle"
         elif is_tau_arch(args):
             args.sched = "cosine"
         elif uses_weighted_reconstruction_loss(args):
@@ -573,6 +597,7 @@ def resolve_scheduler_config(args):
         uses_weighted_reconstruction_loss(args)
         or uses_predrnnpp_openstl_recipe(args)
         or uses_simvp_openstl_recipe(args)
+        or uses_predformer_facts_openstl_loss(args)
         or is_tau_arch(args)
     ):
         args.warmup_epoch = 0
@@ -618,6 +643,8 @@ def resolve_train_loss_mode(args, loss_weights=None):
     if uses_simvp_moganet_openstl_loss(args):
         return "mse_openstl"
     if uses_earthfarseer_openstl_loss(args):
+        return "mse_openstl"
+    if uses_predformer_facts_openstl_loss(args):
         return "mse_openstl"
     if is_tau_arch(args):
         if int(args.out_T) <= 2:
@@ -1212,6 +1239,18 @@ def main():
                 f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
                 f"scheduled_sampling: {args.scheduled_sampling}"
             )
+        if args.arch == "predformer_facts":
+            logger.info(
+                f"predformer_patch_size: {args.predformer_patch_size}  "
+                f"predformer_dim: {args.predformer_dim}  "
+                f"predformer_heads: {args.predformer_heads}  "
+                f"predformer_dim_head: {args.predformer_dim_head}  "
+                f"predformer_dropout: {args.predformer_dropout}  "
+                f"predformer_attn_dropout: {args.predformer_attn_dropout}  "
+                f"predformer_drop_path: {args.predformer_drop_path}  "
+                f"predformer_scale_dim: {args.predformer_scale_dim}  "
+                f"predformer_depth: {args.predformer_depth}"
+            )
 
     # Local targets are always kept available because local metrics and best-model
     # selection can depend on them even when local logging is disabled.
@@ -1322,6 +1361,15 @@ def main():
         predrnnpp_layer_norm=args.predrnnpp_layer_norm,
         predrnnpp_recipe=args.predrnnpp_recipe,
         predrnnpp_reverse_scheduled_sampling=args.reverse_scheduled_sampling,
+        predformer_patch_size=args.predformer_patch_size,
+        predformer_dim=args.predformer_dim,
+        predformer_heads=args.predformer_heads,
+        predformer_dim_head=args.predformer_dim_head,
+        predformer_dropout=args.predformer_dropout,
+        predformer_attn_dropout=args.predformer_attn_dropout,
+        predformer_drop_path=args.predformer_drop_path,
+        predformer_scale_dim=args.predformer_scale_dim,
+        predformer_depth=args.predformer_depth,
         arch=args.arch,
         hybrid_depth=args.hybrid_depth,
         hybrid_heads=args.hybrid_heads,
@@ -1479,7 +1527,11 @@ def main():
                         y.float(),
                     )
                     loss = loss_mse + float(args.tau_alpha) * loss_diff_div
-                elif uses_simvp_moganet_openstl_loss(args) or uses_earthfarseer_openstl_loss(args):
+                elif (
+                    uses_simvp_moganet_openstl_loss(args)
+                    or uses_earthfarseer_openstl_loss(args)
+                    or uses_predformer_facts_openstl_loss(args)
+                ):
                     loss_perceptual = pred.new_zeros(())
                     loss_diff_div = pred.new_zeros(())
                     loss = loss_mse
@@ -1530,7 +1582,11 @@ def main():
                             mse=f"{loss_mse.item():.6f}",
                             diff_div=f"{loss_diff_div.item():.6f}",
                         )
-                    elif uses_simvp_moganet_openstl_loss(args) or uses_earthfarseer_openstl_loss(args):
+                    elif (
+                        uses_simvp_moganet_openstl_loss(args)
+                        or uses_earthfarseer_openstl_loss(args)
+                        or uses_predformer_facts_openstl_loss(args)
+                    ):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mse=f"{loss_mse.item():.6f}",
@@ -1687,7 +1743,11 @@ def main():
                         f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
                         f"train_diff_div: {train_diff_div:.4f}  tau_alpha: {args.tau_alpha:.4f}"
                     )
-                elif uses_simvp_moganet_openstl_loss(args) or uses_earthfarseer_openstl_loss(args):
+                elif (
+                    uses_simvp_moganet_openstl_loss(args)
+                    or uses_earthfarseer_openstl_loss(args)
+                    or uses_predformer_facts_openstl_loss(args)
+                ):
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
                         f"arch: {args.arch}"

@@ -133,6 +133,44 @@ class SimVPModelTypeTests(unittest.TestCase):
                 simvp_model_type="invalid",
             )
 
+    def test_predformer_facts_shape_and_backward_smoke(self):
+        model = SimVPForecast(
+            in_T=4,
+            out_T=2,
+            C=1,
+            H=32,
+            W=32,
+            arch="predformer_facts",
+            predformer_patch_size=8,
+            predformer_dim=64,
+            predformer_heads=4,
+            predformer_dim_head=16,
+            predformer_depth=2,
+        )
+        x = torch.randn(2, 4, 1, 32, 32, requires_grad=True)
+        y = model(x)
+        self.assertEqual(tuple(y.shape), (2, 2, 1, 32, 32))
+        y.square().mean().backward()
+        self.assertTrue(any(param.grad is not None for param in model.parameters() if param.requires_grad))
+
+    def test_predformer_facts_autoregressive_rollout_supports_out_t_gt_in_t(self):
+        model = SimVPForecast(
+            in_T=4,
+            out_T=6,
+            C=1,
+            H=32,
+            W=32,
+            arch="predformer_facts",
+            predformer_patch_size=8,
+            predformer_dim=64,
+            predformer_heads=4,
+            predformer_dim_head=16,
+            predformer_depth=1,
+        )
+        x = torch.randn(1, 4, 1, 32, 32)
+        y = model(x)
+        self.assertEqual(tuple(y.shape), (1, 6, 1, 32, 32))
+
 
 if __name__ == "__main__":
     unittest.main()

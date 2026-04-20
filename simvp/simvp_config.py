@@ -198,6 +198,25 @@ def build_forecast_model_kwargs_from_config(
         "predrnnpp_layer_norm": bool(config.get("predrnnpp_layer_norm", False)),
         "predrnnpp_recipe": predrnnpp_recipe,
         "predrnnpp_reverse_scheduled_sampling": bool(config.get("reverse_scheduled_sampling", False)),
+        "predformer_patch_size": int(_coalesce(overrides.get("predformer_patch_size"), config.get("predformer_patch_size"), 16)),
+        "predformer_dim": int(_coalesce(overrides.get("predformer_dim"), config.get("predformer_dim"), 256)),
+        "predformer_heads": int(_coalesce(overrides.get("predformer_heads"), config.get("predformer_heads"), 8)),
+        "predformer_dim_head": int(
+            _coalesce(overrides.get("predformer_dim_head"), config.get("predformer_dim_head"), 32)
+        ),
+        "predformer_dropout": float(
+            _coalesce(overrides.get("predformer_dropout"), config.get("predformer_dropout"), 0.0)
+        ),
+        "predformer_attn_dropout": float(
+            _coalesce(overrides.get("predformer_attn_dropout"), config.get("predformer_attn_dropout"), 0.0)
+        ),
+        "predformer_drop_path": float(
+            _coalesce(overrides.get("predformer_drop_path"), config.get("predformer_drop_path"), 0.0)
+        ),
+        "predformer_scale_dim": int(
+            _coalesce(overrides.get("predformer_scale_dim"), config.get("predformer_scale_dim"), 4)
+        ),
+        "predformer_depth": int(_coalesce(overrides.get("predformer_depth"), config.get("predformer_depth"), 4)),
         "arch": arch,
         "hybrid_depth": int(config.get("hybrid_depth", 2)),
         "hybrid_heads": int(config.get("hybrid_heads", 8)),

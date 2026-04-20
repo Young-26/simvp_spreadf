@@ -2,6 +2,7 @@ from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
 from .hybrid_unet_facts import HybridUNetFacTS, LocalFRegionBranch, LocalResidualRefiner
 from .model import SimVP
+from .predformer_facts_model import PredFormerFacTS_Model
 from .predrnnpp_model import PredRNNpp_Model
 from .tau_model import TAU_Model
 from .wrapper import SUPPORTED_ARCHS, SimVPForecast
@@ -12,6 +13,7 @@ __all__ = [
     "HybridUNetFacTS",
     "LocalFRegionBranch",
     "LocalResidualRefiner",
+    "PredFormerFacTS_Model",
     "PredRNNpp_Model",
     "SUPPORTED_ARCHS",
     "SimVP",

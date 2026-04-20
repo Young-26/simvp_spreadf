@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
@@ -5,6 +6,7 @@ from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
 from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
+from .predformer_facts_model import PredFormerFacTS_Model
 from .predrnnpp_model import PredRNNpp_Model
 from .simvp_config import (
     PREDRNNPP_RECIPE_CHOICES,
@@ -16,7 +18,7 @@ from .simvp_config import (
 from .tau_model import TAU_Model
 
 
-SUPPORTED_ARCHS = ("simvp", "tau", "earthfarseer", "hybrid_unet_facts", "convlstm", "predrnnpp")
+SUPPORTED_ARCHS = ("simvp", "tau", "earthfarseer", "hybrid_unet_facts", "convlstm", "predrnnpp", "predformer_facts")
 
 
 class SimVPForecast(nn.Module):
@@ -50,6 +52,15 @@ class SimVPForecast(nn.Module):
         predrnnpp_layer_norm: bool = False,
         predrnnpp_recipe: str = "simvp",
         predrnnpp_reverse_scheduled_sampling: bool = False,
+        predformer_patch_size: int = 16,
+        predformer_dim: int = 256,
+        predformer_heads: int = 8,
+        predformer_dim_head: int = 32,
+        predformer_dropout: float = 0.0,
+        predformer_attn_dropout: float = 0.0,
+        predformer_drop_path: float = 0.0,
+        predformer_scale_dim: int = 4,
+        predformer_depth: int = 4,
         arch: str = "simvp",
         hybrid_depth: int = 2,
         hybrid_heads: int = 8,
@@ -186,6 +197,19 @@ class SimVPForecast(nn.Module):
                 layer_norm=predrnnpp_layer_norm,
                 reverse_scheduled_sampling=predrnnpp_reverse_scheduled_sampling,
             )
+        elif self.arch == "predformer_facts":
+            self.backbone = PredFormerFacTS_Model(
+                shape_in=(in_T, C, H, W),
+                patch_size=predformer_patch_size,
+                dim=predformer_dim,
+                heads=predformer_heads,
+                dim_head=predformer_dim_head,
+                dropout=predformer_dropout,
+                attn_dropout=predformer_attn_dropout,
+                drop_path=predformer_drop_path,
+                scale_dim=predformer_scale_dim,
+                depth=predformer_depth,
+            )
         elif self.arch == "hybrid_unet_facts":
             self.backbone = HybridUNetFacTS(
                 in_T=in_T,
@@ -239,6 +263,18 @@ class SimVPForecast(nn.Module):
             return y
         if self.arch == "earthfarseer":
             return y
+        if self.arch == "predformer_facts":
+            if self.out_T <= x.shape[1]:
+                return y[:, :self.out_T]
+
+            pred_chunks = [y]
+            generated = y.shape[1]
+            cur_seq = y
+            while generated < self.out_T:
+                cur_seq = self.backbone(cur_seq)
+                pred_chunks.append(cur_seq)
+                generated += cur_seq.shape[1]
+            return torch.cat(pred_chunks, dim=1)[:, :self.out_T]
         if self.arch == "predrnnpp":
             if return_loss:
                 y, loss = y
