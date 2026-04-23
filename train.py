@@ -211,10 +211,27 @@ def build_parser():
     parser.add_argument("--convlstm_patch_size", type=int, default=4)
     parser.add_argument("--convlstm_stride", type=int, default=1)
     parser.add_argument("--convlstm_layer_norm", action="store_true")
-    parser.add_argument("--mim_hidden", type=str, default="128,128,128,128")
+    parser.add_argument(
+        "--mim_hidden",
+        type=str,
+        default="128,128,128,128",
+        help=(
+            "Comma-separated MIM hidden dims. Current integration intentionally requires "
+            "identical widths across all layers because the OpenSTL-style shared memory "
+            "and MIM diff-state path are only shape-safe for equal-width stacks."
+        ),
+    )
     parser.add_argument("--mim_filter_size", type=int, default=5)
     parser.add_argument("--mim_patch_size", type=int, default=4)
-    parser.add_argument("--mim_stride", type=int, default=1)
+    parser.add_argument(
+        "--mim_stride",
+        type=int,
+        default=1,
+        help=(
+            "MIM recurrent stride. Current integration only supports 1; larger values are "
+            "rejected because hidden/memory spatial sizes and reconstruction are not rewired."
+        ),
+    )
     parser.add_argument("--mim_layer_norm", action="store_true")
     parser.add_argument("--predrnnpp_hidden", type=str, default="128,128,128,128")
     parser.add_argument("--predrnnpp_filter_size", type=int, default=5)
@@ -241,7 +258,10 @@ def build_parser():
     parser.add_argument(
         "--reverse_scheduled_sampling",
         action="store_true",
-        help="Single RSS switch for recurrent OpenSTL-style models. For PredRNNv2 it controls both the model forward branch and the patch-space real_input_flag builder.",
+        help=(
+            "Single RSS switch for recurrent OpenSTL-style models. For MIM and PredRNNv2 it "
+            "controls both the model forward branch and the patch-space real_input_flag builder."
+        ),
     )
     parser.add_argument(
         "--scheduled_sampling",
@@ -554,6 +574,8 @@ def build_predrnnv2_real_input_flag(args, batch_size: int, channels: int, height
 
 
 def build_mim_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    # MIM follows the same OpenSTL patch-space scheduled-sampling contract as the other
+    # recurrent OpenSTL-style ports in this repo.
     return _build_recurrent_real_input_flag(
         batch_size=batch_size,
         channels=channels,
@@ -743,8 +765,9 @@ def resolve_optimizer_config(args):
     args.simvp_recipe = get_simvp_recipe(args)
     opt = str(args.opt).lower()
     if opt == "auto":
-        # PredRNNv2 keeps the OpenSTL cell/loss path, but auto optimizer selection still follows
-        # the simvp_spreadf framework defaults rather than claiming to reproduce the official recipe.
+        # Recurrent OpenSTL-style ports such as MIM and PredRNNv2 keep their cell/loss path,
+        # but auto optimizer selection still follows the simvp_spreadf framework defaults rather
+        # than claiming to reproduce the official paper recipe.
         opt = (
             "adam"
             if uses_predrnn_openstl_sequence_loss(args)
@@ -762,8 +785,8 @@ def resolve_scheduler_config(args):
     args.simvp_model_type = get_simvp_model_type(args)
     args.simvp_recipe = get_simvp_recipe(args)
     if args.sched == "auto":
-        # Likewise, sched=auto stays a framework-level choice. PredRNNv2 is integrated into the
-        # simvp_spreadf training stack here; it is not advertised as an official reproduction run.
+        # Likewise, sched=auto stays a framework-level choice. MIM/PredRNNv2 are integrated into
+        # the simvp_spreadf training stack here; this is not advertised as an official reproduction run.
         if uses_predrnn_openstl_sequence_loss(args):
             args.sched = "onecycle"
         elif uses_simvp_openstl_recipe(args):

@@ -466,6 +466,16 @@ class MIM_Model(nn.Module):
         self.frame_channel = patch_size * patch_size * channels
         self.reverse_scheduled_sampling = bool(reverse_scheduled_sampling)
         self.mse_criterion = nn.MSELoss()
+        # This port keeps the OpenSTL MIM structure intact. In that structure the shared
+        # spatiotemporal memory path and the MIMBlock/MIMN internal state bootstrapping are
+        # only shape-safe when every recurrent layer uses the same hidden width.
+        if len(set(self.num_hidden)) != 1:
+            raise ValueError(
+                "MIM currently requires identical hidden sizes across all layers because the "
+                "OpenSTL-style shared memory path and MIMBlock/MIMN internal state initialization "
+                "assume one common hidden width. Received num_hidden="
+                f"{self.num_hidden}. Use values like '128,128,128,128', not heterogeneous lists."
+            )
 
         if stride != 1:
             raise ValueError(

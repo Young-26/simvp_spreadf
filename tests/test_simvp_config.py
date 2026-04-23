@@ -28,6 +28,13 @@ def _get_action_choices(parser, dest: str):
     raise KeyError(dest)
 
 
+def _get_action_help(parser, dest: str):
+    for action in parser._actions:
+        if action.dest == dest:
+            return action.help
+    raise KeyError(dest)
+
+
 class SimVPConfigTests(unittest.TestCase):
     def _make_train_args(self, **overrides):
         base = dict(
@@ -74,6 +81,14 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(_get_action_choices(infer_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(predict_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(train_lib.build_parser(), "predformer_loss"), ("mae", "mse", "hybrid"))
+
+    def test_train_parser_documents_mim_constraints(self):
+        parser = train_lib.build_parser()
+        mim_hidden_help = _get_action_help(parser, "mim_hidden")
+        mim_stride_help = _get_action_help(parser, "mim_stride")
+
+        self.assertIn("identical widths", mim_hidden_help)
+        self.assertIn("only supports 1", mim_stride_help)
 
     def test_train_and_infer_parsers_accept_aliases(self):
         train_args = train_lib.parse_args(
@@ -190,6 +205,18 @@ class SimVPConfigTests(unittest.TestCase):
 
         self.assertTrue(train_lib.uses_earthfarseer_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+
+    def test_mim_uses_openstl_optimizer_scheduler_and_loss_mode(self):
+        args = self._make_train_args(arch="mim", mim_hidden="8,8,8,8")
+        args = train_lib.resolve_optimizer_config(args)
+        args = train_lib.resolve_scheduler_config(args)
+
+        self.assertTrue(train_lib.uses_mim_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(args.opt, "adam")
+        self.assertEqual(args.sched, "onecycle")
+        self.assertEqual(args.warmup_epoch, 0)
         self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
 
     def test_predformer_facts_uses_mae_openstl_loss_mode(self):

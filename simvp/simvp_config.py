@@ -202,6 +202,8 @@ def build_forecast_model_kwargs_from_config(
         "convlstm_patch_size": int(config.get("convlstm_patch_size", 4)),
         "convlstm_stride": int(config.get("convlstm_stride", 1)),
         "convlstm_layer_norm": bool(config.get("convlstm_layer_norm", False)),
+        # MIM config is persisted for checkpoint rebuilds, but the current port intentionally
+        # supports only equal-width hidden stacks and mim_stride=1.
         "mim_hidden": str(config.get("mim_hidden", "128,128,128,128")),
         "mim_filter_size": int(config.get("mim_filter_size", 5)),
         "mim_patch_size": int(config.get("mim_patch_size", 4)),
