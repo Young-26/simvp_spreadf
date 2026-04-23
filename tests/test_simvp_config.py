@@ -372,7 +372,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(model_kwargs["predrnnv2_stride"], 1)
         self.assertTrue(model_kwargs["predrnnv2_layer_norm"])
         self.assertAlmostEqual(model_kwargs["predrnnv2_decouple_beta"], 0.25)
-        self.assertTrue(model_kwargs["predrnnv2_reverse_scheduled_sampling"])
+        self.assertTrue(model_kwargs["reverse_scheduled_sampling"])
 
 
 if __name__ == "__main__":

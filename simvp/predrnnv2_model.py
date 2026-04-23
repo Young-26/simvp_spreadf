@@ -180,10 +180,14 @@ class PredRNNv2_Model(nn.Module):
             raise ValueError(
                 f"Input size {(height, width)} must be divisible by patch_size={patch_size}."
             )
+        # PredRNNv2's decouple loss reuses one shared adapter on every recurrent layer output.
+        # That matches the OpenSTL implementation, but it also means heterogeneous hidden sizes
+        # cannot be adapted consistently inside this port.
         if len(set(self.num_hidden)) != 1:
             raise ValueError(
-                "PredRNNv2 currently expects identical hidden sizes across layers because the "
-                "OpenSTL decoupling adapter is shared across the recurrent stack."
+                "PredRNNv2 requires identical hidden sizes across all layers because the shared "
+                "decouple adapter is applied to every layer. Received num_hidden="
+                f"{self.num_hidden}. Use values like '128,128,128,128', not heterogeneous lists."
             )
 
         cell_list = []

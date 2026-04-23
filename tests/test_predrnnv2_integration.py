@@ -62,8 +62,45 @@ class PredRNNv2IntegrationTests(unittest.TestCase):
         self.assertEqual(tuple(next_frames.shape), (2, 9, 1, 64, 64))
         self.assertEqual(loss.ndim, 0)
 
+    def test_rss_switch_controls_model_and_mask_builder_consistently(self):
+        for reverse_scheduled_sampling, expected_mask_steps in ((False, 1), (True, 8)):
+            model = SimVPForecast(
+                in_T=8,
+                out_T=2,
+                C=1,
+                H=64,
+                W=64,
+                arch="predrnnv2",
+                predrnnv2_hidden="8,8,8,8",
+                reverse_scheduled_sampling=reverse_scheduled_sampling,
+            )
+            args = Namespace(
+                in_T=8,
+                out_T=2,
+                predrnnv2_patch_size=4,
+                reverse_scheduled_sampling=reverse_scheduled_sampling,
+                scheduled_sampling=True,
+                sampling_start_value=1.0,
+                sampling_stop_iter=50000,
+                r_sampling_step_1=25000,
+                r_sampling_step_2=50000,
+                r_exp_alpha=5000.0,
+            )
+            _, mask = train_lib.build_predrnnv2_real_input_flag(
+                args=args,
+                batch_size=2,
+                channels=1,
+                height=64,
+                width=64,
+                device=torch.device("cpu"),
+                eta=1.0,
+                itr=0,
+            )
+            self.assertEqual(model.backbone.reverse_scheduled_sampling, reverse_scheduled_sampling)
+            self.assertEqual(mask.shape[1], expected_mask_steps)
+
     def test_shared_adapter_requires_uniform_hidden_sizes(self):
-        with self.assertRaisesRegex(ValueError, "identical hidden sizes"):
+        with self.assertRaisesRegex(ValueError, "requires identical hidden sizes"):
             PredRNNv2_Model(
                 shape_in=(8, 1, 64, 64),
                 out_T=2,

@@ -150,6 +150,17 @@ def build_forecast_model_kwargs_from_config(
         config.get("earthfarseer_temporal_depth"),
         None,
     )
+    # reverse_scheduled_sampling is the only active RSS config source for recurrent OpenSTL-style
+    # models. The legacy arch-specific keys are still read here so older checkpoints can rebuild.
+    reverse_scheduled_sampling = bool(
+        _coalesce(
+            overrides.get("reverse_scheduled_sampling"),
+            config.get("reverse_scheduled_sampling"),
+            config.get("predrnnpp_reverse_scheduled_sampling"),
+            config.get("predrnnv2_reverse_scheduled_sampling"),
+            False,
+        )
+    )
 
     kwargs = {
         "in_T": in_T,
@@ -197,14 +208,13 @@ def build_forecast_model_kwargs_from_config(
         "predrnnpp_stride": int(config.get("predrnnpp_stride", 1)),
         "predrnnpp_layer_norm": bool(config.get("predrnnpp_layer_norm", False)),
         "predrnnpp_recipe": predrnnpp_recipe,
-        "predrnnpp_reverse_scheduled_sampling": bool(config.get("reverse_scheduled_sampling", False)),
+        "reverse_scheduled_sampling": reverse_scheduled_sampling,
         "predrnnv2_hidden": str(config.get("predrnnv2_hidden", "128,128,128,128")),
         "predrnnv2_filter_size": int(config.get("predrnnv2_filter_size", 5)),
         "predrnnv2_patch_size": int(config.get("predrnnv2_patch_size", 4)),
         "predrnnv2_stride": int(config.get("predrnnv2_stride", 1)),
         "predrnnv2_layer_norm": bool(config.get("predrnnv2_layer_norm", False)),
         "predrnnv2_decouple_beta": float(config.get("predrnnv2_decouple_beta", 0.1)),
-        "predrnnv2_reverse_scheduled_sampling": bool(config.get("reverse_scheduled_sampling", False)),
         "predformer_patch_size": int(_coalesce(overrides.get("predformer_patch_size"), config.get("predformer_patch_size"), 16)),
         "predformer_dim": int(_coalesce(overrides.get("predformer_dim"), config.get("predformer_dim"), 256)),
         "predformer_heads": int(_coalesce(overrides.get("predformer_heads"), config.get("predformer_heads"), 8)),

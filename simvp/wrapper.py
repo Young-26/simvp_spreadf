@@ -31,6 +31,31 @@ SUPPORTED_ARCHS = (
 )
 
 
+def _resolve_reverse_scheduled_sampling(
+    reverse_scheduled_sampling: Optional[bool],
+    *,
+    predrnnpp_reverse_scheduled_sampling: Optional[bool] = None,
+    predrnnv2_reverse_scheduled_sampling: Optional[bool] = None,
+) -> bool:
+    """Resolve one effective RSS switch while tolerating legacy alias kwargs."""
+    resolved = None if reverse_scheduled_sampling is None else bool(reverse_scheduled_sampling)
+    for legacy_name, legacy_value in (
+        ("predrnnpp_reverse_scheduled_sampling", predrnnpp_reverse_scheduled_sampling),
+        ("predrnnv2_reverse_scheduled_sampling", predrnnv2_reverse_scheduled_sampling),
+    ):
+        if legacy_value is None:
+            continue
+        legacy_value = bool(legacy_value)
+        if resolved is None:
+            resolved = legacy_value
+        elif legacy_value != resolved:
+            raise ValueError(
+                "reverse_scheduled_sampling conflicts with legacy alias "
+                f"{legacy_name}={legacy_value}. Use only reverse_scheduled_sampling."
+            )
+    return False if resolved is None else resolved
+
+
 class SimVPForecast(nn.Module):
     def __init__(
         self,
@@ -61,14 +86,15 @@ class SimVPForecast(nn.Module):
         predrnnpp_stride: int = 1,
         predrnnpp_layer_norm: bool = False,
         predrnnpp_recipe: str = "simvp",
-        predrnnpp_reverse_scheduled_sampling: bool = False,
+        reverse_scheduled_sampling: Optional[bool] = None,
+        predrnnpp_reverse_scheduled_sampling: Optional[bool] = None,
         predrnnv2_hidden: str = "128,128,128,128",
         predrnnv2_filter_size: int = 5,
         predrnnv2_patch_size: int = 4,
         predrnnv2_stride: int = 1,
         predrnnv2_layer_norm: bool = False,
         predrnnv2_decouple_beta: float = 0.1,
-        predrnnv2_reverse_scheduled_sampling: bool = False,
+        predrnnv2_reverse_scheduled_sampling: Optional[bool] = None,
         predformer_patch_size: int = 16,
         predformer_dim: int = 256,
         predformer_heads: int = 8,
@@ -110,6 +136,11 @@ class SimVPForecast(nn.Module):
         self.predrnnpp_recipe = normalize_predrnnpp_recipe(predrnnpp_recipe)
         self.simvp_model_type = normalize_simvp_model_type(simvp_model_type)
         self.simvp_recipe = normalize_simvp_recipe(simvp_recipe)
+        self.reverse_scheduled_sampling = _resolve_reverse_scheduled_sampling(
+            reverse_scheduled_sampling,
+            predrnnpp_reverse_scheduled_sampling=predrnnpp_reverse_scheduled_sampling,
+            predrnnv2_reverse_scheduled_sampling=predrnnv2_reverse_scheduled_sampling,
+        )
         self.simvp_recipe_effective = get_effective_simvp_recipe(
             self.arch,
             self.simvp_model_type,
@@ -212,7 +243,7 @@ class SimVPForecast(nn.Module):
                 patch_size=predrnnpp_patch_size,
                 stride=predrnnpp_stride,
                 layer_norm=predrnnpp_layer_norm,
-                reverse_scheduled_sampling=predrnnpp_reverse_scheduled_sampling,
+                reverse_scheduled_sampling=self.reverse_scheduled_sampling,
             )
         elif self.arch == "predrnnv2":
             if predrnnv2_stride != 1:
@@ -229,7 +260,7 @@ class SimVPForecast(nn.Module):
                 patch_size=predrnnv2_patch_size,
                 stride=predrnnv2_stride,
                 layer_norm=predrnnv2_layer_norm,
-                reverse_scheduled_sampling=predrnnv2_reverse_scheduled_sampling,
+                reverse_scheduled_sampling=self.reverse_scheduled_sampling,
                 decouple_beta=predrnnv2_decouple_beta,
             )
         elif self.arch == "predformer_facts":
@@ -320,6 +351,9 @@ class SimVPForecast(nn.Module):
                 generated += cur_seq.shape[1]
             return torch.cat(pred_chunks, dim=1)[:, :self.out_T]
         if self.arch in ("predrnnpp", "predrnnv2"):
+            # OpenSTL-style recurrent training can emit the whole rollout sequence so the
+            # internal loss can compare against every predicted step. The public wrapper keeps
+            # the rest of simvp_spreadf stable by exposing only the requested forecast tail.
             if return_loss:
                 y, loss = y
                 return y[:, -self.out_T :], loss

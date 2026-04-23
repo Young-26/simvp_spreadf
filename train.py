@@ -203,13 +203,27 @@ def build_parser():
     parser.add_argument("--predrnnpp_stride", type=int, default=1)
     parser.add_argument("--predrnnpp_layer_norm", action="store_true")
     parser.add_argument("--predrnnpp_recipe", type=str, default="simvp", choices=PREDRNNPP_RECIPE_CHOICES)
-    parser.add_argument("--predrnnv2_hidden", type=str, default="128,128,128,128")
+    parser.add_argument(
+        "--predrnnv2_hidden",
+        type=str,
+        default="128,128,128,128",
+        help="Comma-separated PredRNNv2 hidden dims. All layers must use the same size because decouple loss shares one adapter across the full recurrent stack.",
+    )
     parser.add_argument("--predrnnv2_filter_size", type=int, default=5)
     parser.add_argument("--predrnnv2_patch_size", type=int, default=4)
     parser.add_argument("--predrnnv2_stride", type=int, default=1)
     parser.add_argument("--predrnnv2_layer_norm", action="store_true")
-    parser.add_argument("--predrnnv2_decouple_beta", type=float, default=0.1)
-    parser.add_argument("--reverse_scheduled_sampling", action="store_true")
+    parser.add_argument(
+        "--predrnnv2_decouple_beta",
+        type=float,
+        default=0.1,
+        help="PredRNNv2 decouple-loss weight. The model/loss stay OpenSTL-style, but opt=auto/sched=auto still use simvp_spreadf framework defaults unless you override them.",
+    )
+    parser.add_argument(
+        "--reverse_scheduled_sampling",
+        action="store_true",
+        help="Single RSS switch for recurrent OpenSTL-style models. For PredRNNv2 it controls both the model forward branch and the patch-space real_input_flag builder.",
+    )
     parser.add_argument(
         "--scheduled_sampling",
         action=argparse.BooleanOptionalAction,
@@ -398,6 +412,9 @@ def validate_patch_grid(channels: int, height: int, width: int, patch_size: int)
     return patch_h, patch_w, patch_channels
 
 
+# PredRNN++ and PredRNNv2 both follow OpenSTL's patch-space scheduled-sampling interface.
+# The same reverse_scheduled_sampling flag must therefore drive both the model branch choice
+# and the real_input_flag shape logic, otherwise RSS/SS semantics silently diverge.
 def _build_recurrent_real_input_flag(
     *,
     batch_size: int,
@@ -494,6 +511,8 @@ def build_predrnnpp_real_input_flag(args, batch_size: int, channels: int, height
 
 
 def build_predrnnv2_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    # PredRNNv2 keeps its own builder wrapper because the mask lives in patch space and must match
+    # PredRNNv2's patch_size even if other recurrent backbones use different patch grids.
     return _build_recurrent_real_input_flag(
         batch_size=batch_size,
         channels=channels,
@@ -683,6 +702,8 @@ def resolve_optimizer_config(args):
     args.simvp_recipe = get_simvp_recipe(args)
     opt = str(args.opt).lower()
     if opt == "auto":
+        # PredRNNv2 keeps the OpenSTL cell/loss path, but auto optimizer selection still follows
+        # the simvp_spreadf framework defaults rather than claiming to reproduce the official recipe.
         opt = (
             "adam"
             if uses_predrnn_openstl_sequence_loss(args)
@@ -700,6 +721,8 @@ def resolve_scheduler_config(args):
     args.simvp_model_type = get_simvp_model_type(args)
     args.simvp_recipe = get_simvp_recipe(args)
     if args.sched == "auto":
+        # Likewise, sched=auto stays a framework-level choice. PredRNNv2 is integrated into the
+        # simvp_spreadf training stack here; it is not advertised as an official reproduction run.
         if uses_predrnn_openstl_sequence_loss(args):
             args.sched = "onecycle"
         elif uses_simvp_openstl_recipe(args):
@@ -1363,6 +1386,10 @@ def main():
             )
         if args.arch == "predrnnv2":
             logger.info(
+                "PredRNNv2 keeps the OpenSTL recurrent loop and decouple loss, but "
+                "opt=auto/sched=auto here still mean simvp_spreadf framework defaults, not an official reproduction recipe."
+            )
+            logger.info(
                 f"predrnnv2_hidden: {args.predrnnv2_hidden}  "
                 f"filter_size: {args.predrnnv2_filter_size}  "
                 f"patch_size: {args.predrnnv2_patch_size}  "
@@ -1494,14 +1521,13 @@ def main():
         predrnnpp_stride=args.predrnnpp_stride,
         predrnnpp_layer_norm=args.predrnnpp_layer_norm,
         predrnnpp_recipe=args.predrnnpp_recipe,
-        predrnnpp_reverse_scheduled_sampling=args.reverse_scheduled_sampling,
+        reverse_scheduled_sampling=args.reverse_scheduled_sampling,
         predrnnv2_hidden=args.predrnnv2_hidden,
         predrnnv2_filter_size=args.predrnnv2_filter_size,
         predrnnv2_patch_size=args.predrnnv2_patch_size,
         predrnnv2_stride=args.predrnnv2_stride,
         predrnnv2_layer_norm=args.predrnnv2_layer_norm,
         predrnnv2_decouple_beta=args.predrnnv2_decouple_beta,
-        predrnnv2_reverse_scheduled_sampling=args.reverse_scheduled_sampling,
         predformer_patch_size=args.predformer_patch_size,
         predformer_dim=args.predformer_dim,
         predformer_heads=args.predformer_heads,
