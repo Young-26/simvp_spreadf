@@ -73,7 +73,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(_get_action_choices(train_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(infer_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(predict_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
-        self.assertEqual(_get_action_choices(train_lib.build_parser(), "predformer_loss"), ("mae", "mse"))
+        self.assertEqual(_get_action_choices(train_lib.build_parser(), "predformer_loss"), ("mae", "mse", "hybrid"))
 
     def test_train_and_infer_parsers_accept_aliases(self):
         train_args = train_lib.parse_args(
@@ -210,6 +210,18 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
         self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+
+    def test_predformer_facts_supports_hybrid_loss_mode(self):
+        args = self._make_train_args(
+            arch="predformer_facts",
+            simvp_model_type="gsta",
+            simvp_recipe="openstl",
+            predformer_loss="hybrid",
+        )
+
+        self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "0.8000*MAE + 0.2000*MSE")
 
     def test_explicit_simvp_recipe_overrides_take_priority(self):
         args = self._make_train_args(

@@ -110,9 +110,9 @@ def uses_predformer_facts_openstl_loss(args) -> bool:
 
 def get_predformer_loss(args) -> str:
     loss_name = str(getattr(args, "predformer_loss", "mae")).strip().lower()
-    if loss_name not in ("mae", "mse"):
+    if loss_name not in ("mae", "mse", "hybrid"):
         raise ValueError(
-            f"Unsupported predformer_loss '{loss_name}'. Available choices: ('mae', 'mse')."
+            f"Unsupported predformer_loss '{loss_name}'. Available choices: ('mae', 'mse', 'hybrid')."
         )
     return loss_name
 
@@ -252,8 +252,8 @@ def build_parser():
         "--predformer_loss",
         type=str,
         default="mae",
-        choices=("mae", "mse"),
-        help="Training loss for arch='predformer_facts'.",
+        choices=("mae", "mse", "hybrid"),
+        help="Training loss for arch='predformer_facts'. Use 'hybrid' for 0.8*L1 + 0.2*MSE.",
     )
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
@@ -790,7 +790,10 @@ def resolve_train_loss_mode(args, loss_weights=None):
     if uses_earthfarseer_openstl_loss(args):
         return "mse_openstl"
     if uses_predformer_facts_openstl_loss(args):
-        return f"{get_predformer_loss(args)}_openstl"
+        predformer_loss = get_predformer_loss(args)
+        if predformer_loss == "hybrid":
+            return "0.8000*MAE + 0.2000*MSE"
+        return f"{predformer_loss}_openstl"
     if is_tau_arch(args):
         if int(args.out_T) <= 2:
             return f"mse + {float(args.tau_alpha):.4f}*diff_div(inactive_when_out_T<=2)"
@@ -1721,7 +1724,13 @@ def main():
                 elif uses_predformer_facts_openstl_loss(args):
                     loss_perceptual = pred.new_zeros(())
                     loss_diff_div = pred.new_zeros(())
-                    loss = loss_mae if get_predformer_loss(args) == "mae" else loss_mse
+                    predformer_loss = get_predformer_loss(args)
+                    if predformer_loss == "mae":
+                        loss = loss_mae
+                    elif predformer_loss == "mse":
+                        loss = loss_mse
+                    else:
+                        loss = 0.8 * loss_mae + 0.2 * loss_mse
                 elif uses_simvp_moganet_openstl_loss(args):
                     loss_perceptual = pred.new_zeros(())
                     loss_diff_div = pred.new_zeros(())
@@ -1787,14 +1796,21 @@ def main():
                             mse=f"{loss_mse.item():.6f}",
                         )
                     elif uses_predformer_facts_openstl_loss(args):
-                        if get_predformer_loss(args) == "mae":
+                        predformer_loss = get_predformer_loss(args)
+                        if predformer_loss == "mae":
                             iterator.set_postfix(
                                 loss=f"{loss.item():.6f}",
                                 mae=f"{loss_mae.item():.6f}",
                             )
+                        elif predformer_loss == "mse":
+                            iterator.set_postfix(
+                                loss=f"{loss.item():.6f}",
+                                mse=f"{loss_mse.item():.6f}",
+                            )
                         else:
                             iterator.set_postfix(
                                 loss=f"{loss.item():.6f}",
+                                mae=f"{loss_mae.item():.6f}",
                                 mse=f"{loss_mse.item():.6f}",
                             )
                     elif uses_simvp_moganet_openstl_loss(args):
@@ -1967,15 +1983,21 @@ def main():
                         f"arch: {args.arch}"
                     )
                 elif uses_predformer_facts_openstl_loss(args):
-                    if get_predformer_loss(args) == "mae":
+                    predformer_loss = get_predformer_loss(args)
+                    if predformer_loss == "mae":
                         logger.info(
                             f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                             f"arch: {args.arch}"
                         )
-                    else:
+                    elif predformer_loss == "mse":
                         logger.info(
                             f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
                             f"arch: {args.arch}"
+                        )
+                    else:
+                        logger.info(
+                            f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                            f"train_mse: {train_mse:.4f}  arch: {args.arch}"
                         )
                 elif uses_simvp_moganet_openstl_loss(args):
                     logger.info(
