@@ -60,12 +60,24 @@ def is_predrnnpp_arch(args) -> bool:
     return str(args.arch).lower() == "predrnnpp"
 
 
+def is_predrnnv2_arch(args) -> bool:
+    return str(args.arch).lower() == "predrnnv2"
+
+
 def is_tau_arch(args) -> bool:
     return str(args.arch).lower() == "tau"
 
 
 def uses_predrnnpp_openstl_recipe(args) -> bool:
     return is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "openstl"
+
+
+def uses_predrnnv2_openstl_loss(args) -> bool:
+    return is_predrnnv2_arch(args)
+
+
+def uses_predrnn_openstl_sequence_loss(args) -> bool:
+    return uses_predrnnpp_openstl_recipe(args) or uses_predrnnv2_openstl_loss(args)
 
 
 def uses_simvp_openstl_recipe(args) -> bool:
@@ -117,7 +129,7 @@ def uses_local_reconstruction_loss(args) -> bool:
         and not uses_predformer_facts_openstl_loss(args)
         and
         not uses_weighted_reconstruction_loss(args)
-        and not uses_predrnnpp_openstl_recipe(args)
+        and not uses_predrnn_openstl_sequence_loss(args)
         and not is_tau_arch(args)
     )
 
@@ -145,6 +157,8 @@ def should_enable_ddp_find_unused_parameters(args) -> bool:
 def resolve_recipe_tag(args) -> str:
     if is_predrnnpp_arch(args):
         return get_predrnnpp_recipe(args)
+    if is_predrnnv2_arch(args):
+        return "openstl"
     if str(args.arch).lower() == "simvp":
         return get_effective_simvp_recipe_from_args(args)
     return "default"
@@ -189,6 +203,12 @@ def build_parser():
     parser.add_argument("--predrnnpp_stride", type=int, default=1)
     parser.add_argument("--predrnnpp_layer_norm", action="store_true")
     parser.add_argument("--predrnnpp_recipe", type=str, default="simvp", choices=PREDRNNPP_RECIPE_CHOICES)
+    parser.add_argument("--predrnnv2_hidden", type=str, default="128,128,128,128")
+    parser.add_argument("--predrnnv2_filter_size", type=int, default=5)
+    parser.add_argument("--predrnnv2_patch_size", type=int, default=4)
+    parser.add_argument("--predrnnv2_stride", type=int, default=1)
+    parser.add_argument("--predrnnv2_layer_norm", action="store_true")
+    parser.add_argument("--predrnnv2_decouple_beta", type=float, default=0.1)
     parser.add_argument("--reverse_scheduled_sampling", action="store_true")
     parser.add_argument(
         "--scheduled_sampling",
@@ -378,12 +398,31 @@ def validate_patch_grid(channels: int, height: int, width: int, patch_size: int)
     return patch_h, patch_w, patch_channels
 
 
-def build_predrnnpp_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+def _build_recurrent_real_input_flag(
+    *,
+    batch_size: int,
+    channels: int,
+    height: int,
+    width: int,
+    patch_size: int,
+    device,
+    eta: float,
+    itr: int,
+    in_T: int,
+    out_T: int,
+    reverse_scheduled_sampling: bool,
+    scheduled_sampling: bool,
+    sampling_start_value: float,
+    sampling_stop_iter: int,
+    r_sampling_step_1: int,
+    r_sampling_step_2: int,
+    r_exp_alpha: float,
+):
     patch_h, patch_w, patch_channels = validate_patch_grid(
         channels=channels,
         height=height,
         width=width,
-        patch_size=int(args.predrnnpp_patch_size),
+        patch_size=patch_size,
     )
 
     def _expand(binary_flags: torch.Tensor) -> torch.Tensor:
@@ -396,40 +435,84 @@ def build_predrnnpp_real_input_flag(args, batch_size: int, channels: int, height
             .contiguous()
         )
 
-    if args.reverse_scheduled_sampling:
-        if itr < args.r_sampling_step_1:
+    if reverse_scheduled_sampling:
+        if itr < r_sampling_step_1:
             r_eta = 0.5
-        elif itr < args.r_sampling_step_2:
-            r_eta = 1.0 - 0.5 * math.exp(-float(itr - args.r_sampling_step_1) / float(args.r_exp_alpha))
+        elif itr < r_sampling_step_2:
+            r_eta = 1.0 - 0.5 * math.exp(-float(itr - r_sampling_step_1) / float(r_exp_alpha))
         else:
             r_eta = 1.0
 
-        if itr < args.r_sampling_step_1:
+        if itr < r_sampling_step_1:
             future_eta = 0.5
-        elif itr < args.r_sampling_step_2:
-            denom = max(args.r_sampling_step_2 - args.r_sampling_step_1, 1)
-            future_eta = 0.5 - (0.5 / denom) * (itr - args.r_sampling_step_1)
+        elif itr < r_sampling_step_2:
+            denom = max(r_sampling_step_2 - r_sampling_step_1, 1)
+            future_eta = 0.5 - (0.5 / denom) * (itr - r_sampling_step_1)
         else:
             future_eta = 0.0
 
-        history_flags = torch.rand(batch_size, max(args.in_T - 1, 0), device=device) < r_eta
-        future_flags = torch.rand(batch_size, max(args.out_T - 1, 0), device=device) < future_eta
+        history_flags = torch.rand(batch_size, max(in_T - 1, 0), device=device) < r_eta
+        future_flags = torch.rand(batch_size, max(out_T - 1, 0), device=device) < future_eta
         history_mask = _expand(history_flags)
         future_mask = _expand(future_flags)
         return eta, torch.cat([history_mask, future_mask], dim=1)
 
-    zeros = torch.zeros(batch_size, max(args.out_T - 1, 0), patch_h, patch_w, patch_channels, device=device)
-    if not args.scheduled_sampling or args.out_T <= 1:
+    zeros = torch.zeros(batch_size, max(out_T - 1, 0), patch_h, patch_w, patch_channels, device=device)
+    if not scheduled_sampling or out_T <= 1:
         return 0.0, zeros
 
-    if itr < args.sampling_stop_iter:
-        decay = float(args.sampling_start_value) / max(float(args.sampling_stop_iter), 1.0)
+    if itr < sampling_stop_iter:
+        decay = float(sampling_start_value) / max(float(sampling_stop_iter), 1.0)
         eta = max(0.0, eta - decay)
     else:
         eta = 0.0
 
-    future_flags = torch.rand(batch_size, max(args.out_T - 1, 0), device=device) < eta
+    future_flags = torch.rand(batch_size, max(out_T - 1, 0), device=device) < eta
     return eta, _expand(future_flags)
+
+
+def build_predrnnpp_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    return _build_recurrent_real_input_flag(
+        batch_size=batch_size,
+        channels=channels,
+        height=height,
+        width=width,
+        patch_size=int(args.predrnnpp_patch_size),
+        device=device,
+        eta=eta,
+        itr=itr,
+        in_T=int(args.in_T),
+        out_T=int(args.out_T),
+        reverse_scheduled_sampling=bool(args.reverse_scheduled_sampling),
+        scheduled_sampling=bool(args.scheduled_sampling),
+        sampling_start_value=float(args.sampling_start_value),
+        sampling_stop_iter=int(args.sampling_stop_iter),
+        r_sampling_step_1=int(args.r_sampling_step_1),
+        r_sampling_step_2=int(args.r_sampling_step_2),
+        r_exp_alpha=float(args.r_exp_alpha),
+    )
+
+
+def build_predrnnv2_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    return _build_recurrent_real_input_flag(
+        batch_size=batch_size,
+        channels=channels,
+        height=height,
+        width=width,
+        patch_size=int(args.predrnnv2_patch_size),
+        device=device,
+        eta=eta,
+        itr=itr,
+        in_T=int(args.in_T),
+        out_T=int(args.out_T),
+        reverse_scheduled_sampling=bool(args.reverse_scheduled_sampling),
+        scheduled_sampling=bool(args.scheduled_sampling),
+        sampling_start_value=float(args.sampling_start_value),
+        sampling_stop_iter=int(args.sampling_stop_iter),
+        r_sampling_step_1=int(args.r_sampling_step_1),
+        r_sampling_step_2=int(args.r_sampling_step_2),
+        r_exp_alpha=float(args.r_exp_alpha),
+    )
 
 
 def compute_best_score(
@@ -602,7 +685,7 @@ def resolve_optimizer_config(args):
     if opt == "auto":
         opt = (
             "adam"
-            if uses_predrnnpp_openstl_recipe(args)
+            if uses_predrnn_openstl_sequence_loss(args)
             or uses_simvp_openstl_recipe(args)
             or is_tau_arch(args)
             or uses_predformer_facts_openstl_loss(args)
@@ -617,7 +700,7 @@ def resolve_scheduler_config(args):
     args.simvp_model_type = get_simvp_model_type(args)
     args.simvp_recipe = get_simvp_recipe(args)
     if args.sched == "auto":
-        if uses_predrnnpp_openstl_recipe(args):
+        if uses_predrnn_openstl_sequence_loss(args):
             args.sched = "onecycle"
         elif uses_simvp_openstl_recipe(args):
             args.sched = "onecycle"
@@ -631,7 +714,7 @@ def resolve_scheduler_config(args):
             args.sched = "none"
     if (
         uses_weighted_reconstruction_loss(args)
-        or uses_predrnnpp_openstl_recipe(args)
+        or uses_predrnn_openstl_sequence_loss(args)
         or uses_simvp_openstl_recipe(args)
         or uses_predformer_facts_openstl_loss(args)
         or is_tau_arch(args)
@@ -677,6 +760,8 @@ def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, log
 def resolve_train_loss_mode(args, loss_weights=None):
     if uses_predrnnpp_openstl_recipe(args):
         return "mse_openstl"
+    if uses_predrnnv2_openstl_loss(args):
+        return f"mse_openstl + {float(args.predrnnv2_decouple_beta):.4f}*decouple"
     if uses_simvp_moganet_openstl_loss(args):
         return "mae_openstl"
     if uses_earthfarseer_openstl_loss(args):
@@ -1276,6 +1361,17 @@ def main():
                 f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
                 f"scheduled_sampling: {args.scheduled_sampling}"
             )
+        if args.arch == "predrnnv2":
+            logger.info(
+                f"predrnnv2_hidden: {args.predrnnv2_hidden}  "
+                f"filter_size: {args.predrnnv2_filter_size}  "
+                f"patch_size: {args.predrnnv2_patch_size}  "
+                f"stride: {args.predrnnv2_stride}  "
+                f"layer_norm: {args.predrnnv2_layer_norm}  "
+                f"decouple_beta: {args.predrnnv2_decouple_beta}  "
+                f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
+                f"scheduled_sampling: {args.scheduled_sampling}"
+            )
         if args.arch == "predformer_facts":
             logger.info(
                 f"predformer_patch_size: {args.predformer_patch_size}  "
@@ -1399,6 +1495,13 @@ def main():
         predrnnpp_layer_norm=args.predrnnpp_layer_norm,
         predrnnpp_recipe=args.predrnnpp_recipe,
         predrnnpp_reverse_scheduled_sampling=args.reverse_scheduled_sampling,
+        predrnnv2_hidden=args.predrnnv2_hidden,
+        predrnnv2_filter_size=args.predrnnv2_filter_size,
+        predrnnv2_patch_size=args.predrnnv2_patch_size,
+        predrnnv2_stride=args.predrnnv2_stride,
+        predrnnv2_layer_norm=args.predrnnv2_layer_norm,
+        predrnnv2_decouple_beta=args.predrnnv2_decouple_beta,
+        predrnnv2_reverse_scheduled_sampling=args.reverse_scheduled_sampling,
         predformer_patch_size=args.predformer_patch_size,
         predformer_dim=args.predformer_dim,
         predformer_heads=args.predformer_heads,
@@ -1478,7 +1581,7 @@ def main():
     reason = ""
     completed_epochs = 0
     global_step = 0
-    predrnnpp_sampling_eta = float(args.sampling_start_value)
+    predrnn_sampling_eta = float(args.sampling_start_value)
 
     try:
         for epoch in range(1, args.epochs + 1):
@@ -1516,14 +1619,32 @@ def main():
                 with get_amp_autocast(device.type, amp_enabled):
                     if uses_predrnnpp_openstl_recipe(args):
                         full_sequence = torch.cat([x, y], dim=1)
-                        predrnnpp_sampling_eta, mask_true = build_predrnnpp_real_input_flag(
+                        predrnn_sampling_eta, mask_true = build_predrnnpp_real_input_flag(
                             args=args,
                             batch_size=x.size(0),
                             channels=x.shape[2],
                             height=x.shape[3],
                             width=x.shape[4],
                             device=device,
-                            eta=predrnnpp_sampling_eta,
+                            eta=predrnn_sampling_eta,
+                            itr=global_step,
+                        )
+                        pred, loss = model(
+                            full_sequence,
+                            mask_true=mask_true,
+                            return_loss=True,
+                        )
+                        loss_local = pred.new_zeros(())
+                    elif uses_predrnnv2_openstl_loss(args):
+                        full_sequence = torch.cat([x, y], dim=1)
+                        predrnn_sampling_eta, mask_true = build_predrnnv2_real_input_flag(
+                            args=args,
+                            batch_size=x.size(0),
+                            channels=x.shape[2],
+                            height=x.shape[3],
+                            width=x.shape[4],
+                            device=device,
+                            eta=predrnn_sampling_eta,
                             itr=global_step,
                         )
                         pred, loss = model(
@@ -1615,6 +1736,12 @@ def main():
                             perceptual=f"{loss_perceptual.item():.6f}",
                         )
                     elif uses_predrnnpp_openstl_recipe(args):
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mae=f"{loss_mae.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
+                        )
+                    elif uses_predrnnv2_openstl_loss(args):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mae=f"{loss_mae.item():.6f}",
@@ -1795,6 +1922,11 @@ def main():
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  recipe: {args.predrnnpp_recipe}"
+                    )
+                elif uses_predrnnv2_openstl_loss(args):
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                        f"train_mse: {train_mse:.4f}  decouple_beta: {args.predrnnv2_decouple_beta:.4f}"
                     )
                 elif is_tau_arch(args):
                     logger.info(

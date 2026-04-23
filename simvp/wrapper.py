@@ -8,6 +8,7 @@ from .hybrid_unet_facts import HybridUNetFacTS
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
 from .predrnnpp_model import PredRNNpp_Model
+from .predrnnv2_model import PredRNNv2_Model
 from .simvp_config import (
     PREDRNNPP_RECIPE_CHOICES,
     get_effective_simvp_recipe,
@@ -18,7 +19,16 @@ from .simvp_config import (
 from .tau_model import TAU_Model
 
 
-SUPPORTED_ARCHS = ("simvp", "tau", "earthfarseer", "hybrid_unet_facts", "convlstm", "predrnnpp", "predformer_facts")
+SUPPORTED_ARCHS = (
+    "simvp",
+    "tau",
+    "earthfarseer",
+    "hybrid_unet_facts",
+    "convlstm",
+    "predrnnpp",
+    "predrnnv2",
+    "predformer_facts",
+)
 
 
 class SimVPForecast(nn.Module):
@@ -52,6 +62,13 @@ class SimVPForecast(nn.Module):
         predrnnpp_layer_norm: bool = False,
         predrnnpp_recipe: str = "simvp",
         predrnnpp_reverse_scheduled_sampling: bool = False,
+        predrnnv2_hidden: str = "128,128,128,128",
+        predrnnv2_filter_size: int = 5,
+        predrnnv2_patch_size: int = 4,
+        predrnnv2_stride: int = 1,
+        predrnnv2_layer_norm: bool = False,
+        predrnnv2_decouple_beta: float = 0.1,
+        predrnnv2_reverse_scheduled_sampling: bool = False,
         predformer_patch_size: int = 16,
         predformer_dim: int = 256,
         predformer_heads: int = 8,
@@ -197,6 +214,24 @@ class SimVPForecast(nn.Module):
                 layer_norm=predrnnpp_layer_norm,
                 reverse_scheduled_sampling=predrnnpp_reverse_scheduled_sampling,
             )
+        elif self.arch == "predrnnv2":
+            if predrnnv2_stride != 1:
+                raise ValueError(
+                    "PredRNNv2 in simvp_spreadf only supports predrnnv2_stride=1. "
+                    "stride>1 is not wired through the hidden/memory spatial shapes, LayerNorm, "
+                    "or output reconstruction path."
+                )
+            self.backbone = PredRNNv2_Model(
+                shape_in=(in_T, C, H, W),
+                out_T=out_T,
+                num_hidden=predrnnv2_hidden,
+                filter_size=predrnnv2_filter_size,
+                patch_size=predrnnv2_patch_size,
+                stride=predrnnv2_stride,
+                layer_norm=predrnnv2_layer_norm,
+                reverse_scheduled_sampling=predrnnv2_reverse_scheduled_sampling,
+                decouple_beta=predrnnv2_decouple_beta,
+            )
         elif self.arch == "predformer_facts":
             # predformer_depth remains the external config name for compatibility. In this
             # FacTS port it controls the shared stack depth used by both transformer branches.
@@ -245,8 +280,8 @@ class SimVPForecast(nn.Module):
         x: [B, in_T, C, H, W]
         return: [B, out_T, C, H, W]
         """
-        if return_loss and self.arch != "predrnnpp":
-            raise ValueError("return_loss is only supported for arch='predrnnpp'.")
+        if return_loss and self.arch not in ("predrnnpp", "predrnnv2"):
+            raise ValueError("return_loss is only supported for arch='predrnnpp' or arch='predrnnv2'.")
 
         if self.arch == "hybrid_unet_facts":
             y = self.backbone(x, x_local=x_local, return_aux=return_aux, strict_local=strict_local)
@@ -257,6 +292,13 @@ class SimVPForecast(nn.Module):
                 return_loss=return_loss,
                 loss_target=loss_target,
                 recipe=self.predrnnpp_recipe,
+            )
+        elif self.arch == "predrnnv2":
+            y = self.backbone(
+                x,
+                mask_true=mask_true,
+                return_loss=return_loss,
+                loss_target=loss_target,
             )
         else:
             y = self.backbone(x)
@@ -277,7 +319,7 @@ class SimVPForecast(nn.Module):
                 pred_chunks.append(cur_seq)
                 generated += cur_seq.shape[1]
             return torch.cat(pred_chunks, dim=1)[:, :self.out_T]
-        if self.arch == "predrnnpp":
+        if self.arch in ("predrnnpp", "predrnnv2"):
             if return_loss:
                 y, loss = y
                 return y[:, -self.out_T :], loss

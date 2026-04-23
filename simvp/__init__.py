@@ -4,6 +4,7 @@ from .hybrid_unet_facts import HybridUNetFacTS, LocalFRegionBranch, LocalResidua
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
 from .predrnnpp_model import PredRNNpp_Model
+from .predrnnv2_model import PredRNNv2_Model
 from .tau_model import TAU_Model
 from .wrapper import SUPPORTED_ARCHS, SimVPForecast
 
@@ -15,6 +16,7 @@ __all__ = [
     "LocalResidualRefiner",
     "PredFormerFacTS_Model",
     "PredRNNpp_Model",
+    "PredRNNv2_Model",
     "SUPPORTED_ARCHS",
     "SimVP",
     "SimVPForecast",

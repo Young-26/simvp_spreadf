@@ -348,6 +348,32 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(model_kwargs["predformer_dim_head"], 16)
         self.assertEqual(model_kwargs["predformer_depth"], 2)
 
+    def test_build_forecast_model_kwargs_includes_predrnnv2_fields(self):
+        model_kwargs, metadata = build_forecast_model_kwargs_from_config(
+            {
+                "arch": "predrnnv2",
+                "in_T": 8,
+                "out_T": 2,
+                "predrnnv2_hidden": "8,8,8,8",
+                "predrnnv2_filter_size": 3,
+                "predrnnv2_patch_size": 2,
+                "predrnnv2_stride": 1,
+                "predrnnv2_layer_norm": True,
+                "predrnnv2_decouple_beta": 0.25,
+                "reverse_scheduled_sampling": True,
+            },
+            image_mode="L",
+            image_size=32,
+        )
+        self.assertEqual(metadata["arch"], "predrnnv2")
+        self.assertEqual(model_kwargs["predrnnv2_hidden"], "8,8,8,8")
+        self.assertEqual(model_kwargs["predrnnv2_filter_size"], 3)
+        self.assertEqual(model_kwargs["predrnnv2_patch_size"], 2)
+        self.assertEqual(model_kwargs["predrnnv2_stride"], 1)
+        self.assertTrue(model_kwargs["predrnnv2_layer_norm"])
+        self.assertAlmostEqual(model_kwargs["predrnnv2_decouple_beta"], 0.25)
+        self.assertTrue(model_kwargs["predrnnv2_reverse_scheduled_sampling"])
+
 
 if __name__ == "__main__":
     unittest.main()
