@@ -122,6 +122,20 @@ def uses_local_reconstruction_loss(args) -> bool:
     )
 
 
+def get_default_weighted_reconstruction_loss_weights(args) -> dict:
+    if is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "simvp":
+        return {
+            "mae": 0.80,
+            "mse": 0.15,
+            "perceptual": 0.05,
+        }
+    return {
+        "mae": 0.15,
+        "mse": 0.80,
+        "perceptual": 0.05,
+    }
+
+
 def should_enable_ddp_find_unused_parameters(args) -> bool:
     # OpenSTL's PredRNN++ reference cell registers conv_o but does not consume it in forward().
     # DDP therefore needs unused-parameter detection for PredRNN++ training on multiple GPUs.
@@ -254,9 +268,9 @@ def build_parser():
     parser.add_argument("--use_local_branch", action="store_true")
     parser.add_argument("--lambda_global", type=float, default=1.0)
     parser.add_argument("--lambda_local", type=float, default=0.5)
-    parser.add_argument("--loss_mae_weight", type=float, default=0.15)
-    parser.add_argument("--loss_mse_weight", type=float, default=0.80)
-    parser.add_argument("--loss_percep_weight", type=float, default=0.05)
+    parser.add_argument("--loss_mae_weight", type=float, default=None)
+    parser.add_argument("--loss_mse_weight", type=float, default=None)
+    parser.add_argument("--loss_percep_weight", type=float, default=None)
     parser.add_argument(
         "--disable_perceptual_when_untrained_vgg",
         action=argparse.BooleanOptionalAction,
@@ -627,10 +641,11 @@ def resolve_scheduler_config(args):
 
 
 def resolve_weighted_reconstruction_loss_weights(args, perceptual_criterion, logger=None):
+    defaults = get_default_weighted_reconstruction_loss_weights(args)
     weights = {
-        "mae": float(args.loss_mae_weight),
-        "mse": float(args.loss_mse_weight),
-        "perceptual": float(args.loss_percep_weight),
+        "mae": defaults["mae"] if args.loss_mae_weight is None else float(args.loss_mae_weight),
+        "mse": defaults["mse"] if args.loss_mse_weight is None else float(args.loss_mse_weight),
+        "perceptual": defaults["perceptual"] if args.loss_percep_weight is None else float(args.loss_percep_weight),
     }
     for name, value in weights.items():
         if value < 0:
