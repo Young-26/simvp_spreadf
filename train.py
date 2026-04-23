@@ -64,6 +64,10 @@ def is_predrnnv2_arch(args) -> bool:
     return str(args.arch).lower() == "predrnnv2"
 
 
+def is_mim_arch(args) -> bool:
+    return str(args.arch).lower() == "mim"
+
+
 def is_tau_arch(args) -> bool:
     return str(args.arch).lower() == "tau"
 
@@ -76,8 +80,16 @@ def uses_predrnnv2_openstl_loss(args) -> bool:
     return is_predrnnv2_arch(args)
 
 
+def uses_mim_openstl_loss(args) -> bool:
+    return is_mim_arch(args)
+
+
 def uses_predrnn_openstl_sequence_loss(args) -> bool:
-    return uses_predrnnpp_openstl_recipe(args) or uses_predrnnv2_openstl_loss(args)
+    return (
+        uses_predrnnpp_openstl_recipe(args)
+        or uses_predrnnv2_openstl_loss(args)
+        or uses_mim_openstl_loss(args)
+    )
 
 
 def uses_simvp_openstl_recipe(args) -> bool:
@@ -159,6 +171,8 @@ def resolve_recipe_tag(args) -> str:
         return get_predrnnpp_recipe(args)
     if is_predrnnv2_arch(args):
         return "openstl"
+    if is_mim_arch(args):
+        return "openstl"
     if str(args.arch).lower() == "simvp":
         return get_effective_simvp_recipe_from_args(args)
     return "default"
@@ -197,6 +211,11 @@ def build_parser():
     parser.add_argument("--convlstm_patch_size", type=int, default=4)
     parser.add_argument("--convlstm_stride", type=int, default=1)
     parser.add_argument("--convlstm_layer_norm", action="store_true")
+    parser.add_argument("--mim_hidden", type=str, default="128,128,128,128")
+    parser.add_argument("--mim_filter_size", type=int, default=5)
+    parser.add_argument("--mim_patch_size", type=int, default=4)
+    parser.add_argument("--mim_stride", type=int, default=1)
+    parser.add_argument("--mim_layer_norm", action="store_true")
     parser.add_argument("--predrnnpp_hidden", type=str, default="128,128,128,128")
     parser.add_argument("--predrnnpp_filter_size", type=int, default=5)
     parser.add_argument("--predrnnpp_patch_size", type=int, default=4)
@@ -534,6 +553,28 @@ def build_predrnnv2_real_input_flag(args, batch_size: int, channels: int, height
     )
 
 
+def build_mim_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    return _build_recurrent_real_input_flag(
+        batch_size=batch_size,
+        channels=channels,
+        height=height,
+        width=width,
+        patch_size=int(args.mim_patch_size),
+        device=device,
+        eta=eta,
+        itr=itr,
+        in_T=int(args.in_T),
+        out_T=int(args.out_T),
+        reverse_scheduled_sampling=bool(args.reverse_scheduled_sampling),
+        scheduled_sampling=bool(args.scheduled_sampling),
+        sampling_start_value=float(args.sampling_start_value),
+        sampling_stop_iter=int(args.sampling_stop_iter),
+        r_sampling_step_1=int(args.r_sampling_step_1),
+        r_sampling_step_2=int(args.r_sampling_step_2),
+        r_exp_alpha=float(args.r_exp_alpha),
+    )
+
+
 def compute_best_score(
     val_mae: float,
     val_local_mae: float,
@@ -785,6 +826,8 @@ def resolve_train_loss_mode(args, loss_weights=None):
         return "mse_openstl"
     if uses_predrnnv2_openstl_loss(args):
         return f"mse_openstl + {float(args.predrnnv2_decouple_beta):.4f}*decouple"
+    if uses_mim_openstl_loss(args):
+        return "mse_openstl"
     if uses_simvp_moganet_openstl_loss(args):
         return "mae_openstl"
     if uses_earthfarseer_openstl_loss(args):
@@ -1376,6 +1419,20 @@ def main():
                 f"stride: {args.convlstm_stride}  "
                 f"layer_norm: {args.convlstm_layer_norm}"
             )
+        if args.arch == "mim":
+            logger.info(
+                "MIM keeps the OpenSTL recurrent loop and full-sequence MSE objective, "
+                "but opt=auto/sched=auto here still mean simvp_spreadf framework defaults, not an official reproduction recipe."
+            )
+            logger.info(
+                f"mim_hidden: {args.mim_hidden}  "
+                f"filter_size: {args.mim_filter_size}  "
+                f"patch_size: {args.mim_patch_size}  "
+                f"stride: {args.mim_stride}  "
+                f"layer_norm: {args.mim_layer_norm}  "
+                f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
+                f"scheduled_sampling: {args.scheduled_sampling}"
+            )
         if args.arch == "predrnnpp":
             logger.info(
                 f"predrnnpp_hidden: {args.predrnnpp_hidden}  "
@@ -1518,6 +1575,11 @@ def main():
         convlstm_patch_size=args.convlstm_patch_size,
         convlstm_stride=args.convlstm_stride,
         convlstm_layer_norm=args.convlstm_layer_norm,
+        mim_hidden=args.mim_hidden,
+        mim_filter_size=args.mim_filter_size,
+        mim_patch_size=args.mim_patch_size,
+        mim_stride=args.mim_stride,
+        mim_layer_norm=args.mim_layer_norm,
         predrnnpp_hidden=args.predrnnpp_hidden,
         predrnnpp_filter_size=args.predrnnpp_filter_size,
         predrnnpp_patch_size=args.predrnnpp_patch_size,
@@ -1682,6 +1744,24 @@ def main():
                             return_loss=True,
                         )
                         loss_local = pred.new_zeros(())
+                    elif uses_mim_openstl_loss(args):
+                        full_sequence = torch.cat([x, y], dim=1)
+                        predrnn_sampling_eta, mask_true = build_mim_real_input_flag(
+                            args=args,
+                            batch_size=x.size(0),
+                            channels=x.shape[2],
+                            height=x.shape[3],
+                            width=x.shape[4],
+                            device=device,
+                            eta=predrnn_sampling_eta,
+                            itr=global_step,
+                        )
+                        pred, loss = model(
+                            full_sequence,
+                            mask_true=mask_true,
+                            return_loss=True,
+                        )
+                        loss_local = pred.new_zeros(())
                     else:
                         pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
                         if uses_local_reconstruction_loss(args):
@@ -1777,6 +1857,12 @@ def main():
                             mse=f"{loss_mse.item():.6f}",
                         )
                     elif uses_predrnnv2_openstl_loss(args):
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mae=f"{loss_mae.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
+                        )
+                    elif uses_mim_openstl_loss(args):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mae=f"{loss_mae.item():.6f}",
@@ -1969,6 +2055,11 @@ def main():
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  decouple_beta: {args.predrnnv2_decouple_beta:.4f}"
+                    )
+                elif uses_mim_openstl_loss(args):
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                        f"train_mse: {train_mse:.4f}  arch: {args.arch}"
                     )
                 elif is_tau_arch(args):
                     logger.info(

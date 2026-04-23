@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
 from .hybrid_unet_facts import HybridUNetFacTS
+from .mim_model import MIM_Model
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
 from .predrnnpp_model import PredRNNpp_Model
@@ -25,6 +26,7 @@ SUPPORTED_ARCHS = (
     "earthfarseer",
     "hybrid_unet_facts",
     "convlstm",
+    "mim",
     "predrnnpp",
     "predrnnv2",
     "predformer_facts",
@@ -80,6 +82,11 @@ class SimVPForecast(nn.Module):
         convlstm_patch_size: int = 4,
         convlstm_stride: int = 1,
         convlstm_layer_norm: bool = False,
+        mim_hidden: str = "128,128,128,128",
+        mim_filter_size: int = 5,
+        mim_patch_size: int = 4,
+        mim_stride: int = 1,
+        mim_layer_norm: bool = False,
         predrnnpp_hidden: str = "128,128,128,128",
         predrnnpp_filter_size: int = 5,
         predrnnpp_patch_size: int = 4,
@@ -228,6 +235,23 @@ class SimVPForecast(nn.Module):
                 stride=convlstm_stride,
                 layer_norm=convlstm_layer_norm,
             )
+        elif self.arch == "mim":
+            if mim_stride != 1:
+                raise ValueError(
+                    "MIM in simvp_spreadf only supports mim_stride=1. "
+                    "stride>1 is not wired through the hidden/memory spatial shapes, LayerNorm, "
+                    "or output reconstruction path."
+                )
+            self.backbone = MIM_Model(
+                shape_in=(in_T, C, H, W),
+                out_T=out_T,
+                num_hidden=mim_hidden,
+                filter_size=mim_filter_size,
+                patch_size=mim_patch_size,
+                stride=mim_stride,
+                layer_norm=mim_layer_norm,
+                reverse_scheduled_sampling=self.reverse_scheduled_sampling,
+            )
         elif self.arch == "predrnnpp":
             if predrnnpp_stride != 1:
                 raise ValueError(
@@ -311,8 +335,8 @@ class SimVPForecast(nn.Module):
         x: [B, in_T, C, H, W]
         return: [B, out_T, C, H, W]
         """
-        if return_loss and self.arch not in ("predrnnpp", "predrnnv2"):
-            raise ValueError("return_loss is only supported for arch='predrnnpp' or arch='predrnnv2'.")
+        if return_loss and self.arch not in ("mim", "predrnnpp", "predrnnv2"):
+            raise ValueError("return_loss is only supported for arch='mim', 'predrnnpp', or 'predrnnv2'.")
 
         if self.arch == "hybrid_unet_facts":
             y = self.backbone(x, x_local=x_local, return_aux=return_aux, strict_local=strict_local)
@@ -325,6 +349,13 @@ class SimVPForecast(nn.Module):
                 recipe=self.predrnnpp_recipe,
             )
         elif self.arch == "predrnnv2":
+            y = self.backbone(
+                x,
+                mask_true=mask_true,
+                return_loss=return_loss,
+                loss_target=loss_target,
+            )
+        elif self.arch == "mim":
             y = self.backbone(
                 x,
                 mask_true=mask_true,
@@ -350,7 +381,7 @@ class SimVPForecast(nn.Module):
                 pred_chunks.append(cur_seq)
                 generated += cur_seq.shape[1]
             return torch.cat(pred_chunks, dim=1)[:, :self.out_T]
-        if self.arch in ("predrnnpp", "predrnnv2"):
+        if self.arch in ("mim", "predrnnpp", "predrnnv2"):
             # OpenSTL-style recurrent training can emit the whole rollout sequence so the
             # internal loss can compare against every predicted step. The public wrapper keeps
             # the rest of simvp_spreadf stable by exposing only the requested forecast tail.

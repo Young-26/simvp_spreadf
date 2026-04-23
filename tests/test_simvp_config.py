@@ -386,6 +386,30 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertAlmostEqual(model_kwargs["predrnnv2_decouple_beta"], 0.25)
         self.assertTrue(model_kwargs["reverse_scheduled_sampling"])
 
+    def test_build_forecast_model_kwargs_includes_mim_fields(self):
+        model_kwargs, metadata = build_forecast_model_kwargs_from_config(
+            {
+                "arch": "mim",
+                "in_T": 8,
+                "out_T": 2,
+                "mim_hidden": "8,8,8,8",
+                "mim_filter_size": 3,
+                "mim_patch_size": 2,
+                "mim_stride": 1,
+                "mim_layer_norm": True,
+                "reverse_scheduled_sampling": True,
+            },
+            image_mode="L",
+            image_size=32,
+        )
+        self.assertEqual(metadata["arch"], "mim")
+        self.assertEqual(model_kwargs["mim_hidden"], "8,8,8,8")
+        self.assertEqual(model_kwargs["mim_filter_size"], 3)
+        self.assertEqual(model_kwargs["mim_patch_size"], 2)
+        self.assertEqual(model_kwargs["mim_stride"], 1)
+        self.assertTrue(model_kwargs["mim_layer_norm"])
+        self.assertTrue(model_kwargs["reverse_scheduled_sampling"])
+
 
 if __name__ == "__main__":
     unittest.main()

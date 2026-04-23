@@ -1,6 +1,7 @@
 from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
 from .hybrid_unet_facts import HybridUNetFacTS, LocalFRegionBranch, LocalResidualRefiner
+from .mim_model import MIM_Model
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
 from .predrnnpp_model import PredRNNpp_Model
@@ -14,6 +15,7 @@ __all__ = [
     "HybridUNetFacTS",
     "LocalFRegionBranch",
     "LocalResidualRefiner",
+    "MIM_Model",
     "PredFormerFacTS_Model",
     "PredRNNpp_Model",
     "PredRNNv2_Model",
