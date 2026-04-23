@@ -68,6 +68,10 @@ def is_mim_arch(args) -> bool:
     return str(args.arch).lower() == "mim"
 
 
+def is_mau_arch(args) -> bool:
+    return str(args.arch).lower() == "mau"
+
+
 def is_tau_arch(args) -> bool:
     return str(args.arch).lower() == "tau"
 
@@ -84,11 +88,16 @@ def uses_mim_openstl_loss(args) -> bool:
     return is_mim_arch(args)
 
 
+def uses_mau_openstl_loss(args) -> bool:
+    return is_mau_arch(args)
+
+
 def uses_predrnn_openstl_sequence_loss(args) -> bool:
     return (
         uses_predrnnpp_openstl_recipe(args)
         or uses_predrnnv2_openstl_loss(args)
         or uses_mim_openstl_loss(args)
+        or uses_mau_openstl_loss(args)
     )
 
 
@@ -175,6 +184,8 @@ def resolve_recipe_tag(args) -> str:
         return "openstl"
     if is_mim_arch(args):
         return "openstl"
+    if is_mau_arch(args):
+        return "openstl"
     if str(args.arch).lower() == "simvp":
         return get_effective_simvp_recipe_from_args(args)
     return "default"
@@ -235,6 +246,33 @@ def build_parser():
         ),
     )
     parser.add_argument("--mim_layer_norm", action="store_true")
+    parser.add_argument(
+        "--mau_hidden",
+        type=str,
+        default="64,64,64,64",
+        help=(
+            "Comma-separated MAU hidden dims. Current integration requires identical widths across "
+            "all layers because the temporal-state attention buffers share one channel width."
+        ),
+    )
+    parser.add_argument("--mau_filter_size", type=int, default=5)
+    parser.add_argument("--mau_patch_size", type=int, default=1)
+    parser.add_argument(
+        "--mau_stride",
+        type=int,
+        default=1,
+        help="MAU recurrent stride. Current integration only supports 1.",
+    )
+    parser.add_argument(
+        "--mau_sr_size",
+        type=int,
+        default=4,
+        help="MAU spatial reduction factor. Must be a power of two.",
+    )
+    parser.add_argument("--mau_tau", type=int, default=5)
+    parser.add_argument("--mau_cell_mode", type=str, default="normal", choices=("normal", "residual"))
+    parser.add_argument("--mau_model_mode", type=str, default="normal", choices=("normal", "recall"))
+    parser.add_argument("--mau_layer_norm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--predrnnpp_hidden", type=str, default="128,128,128,128")
     parser.add_argument("--predrnnpp_filter_size", type=int, default=5)
     parser.add_argument("--predrnnpp_patch_size", type=int, default=4)
@@ -599,6 +637,28 @@ def build_mim_real_input_flag(args, batch_size: int, channels: int, height: int,
     )
 
 
+def build_mau_real_input_flag(args, batch_size: int, channels: int, height: int, width: int, device, eta: float, itr: int):
+    return _build_recurrent_real_input_flag(
+        batch_size=batch_size,
+        channels=channels,
+        height=height,
+        width=width,
+        patch_size=int(args.mau_patch_size),
+        device=device,
+        eta=eta,
+        itr=itr,
+        in_T=int(args.in_T),
+        out_T=int(args.out_T),
+        reverse_scheduled_sampling=False,
+        scheduled_sampling=bool(args.scheduled_sampling),
+        sampling_start_value=float(args.sampling_start_value),
+        sampling_stop_iter=int(args.sampling_stop_iter),
+        r_sampling_step_1=int(args.r_sampling_step_1),
+        r_sampling_step_2=int(args.r_sampling_step_2),
+        r_exp_alpha=float(args.r_exp_alpha),
+    )
+
+
 def compute_best_score(
     val_mae: float,
     val_local_mae: float,
@@ -852,6 +912,8 @@ def resolve_train_loss_mode(args, loss_weights=None):
     if uses_predrnnv2_openstl_loss(args):
         return f"mse_openstl + {float(args.predrnnv2_decouple_beta):.4f}*decouple"
     if uses_mim_openstl_loss(args):
+        return "mse_openstl"
+    if uses_mau_openstl_loss(args):
         return "mse_openstl"
     if uses_simvp_moganet_openstl_loss(args):
         return "mae_openstl"
@@ -1444,6 +1506,23 @@ def main():
                 f"stride: {args.convlstm_stride}  "
                 f"layer_norm: {args.convlstm_layer_norm}"
             )
+        if args.arch == "mau":
+            logger.info(
+                "MAU keeps the OpenSTL recurrent loop and full-sequence MSE objective, "
+                "but opt=auto/sched=auto here still mean simvp_spreadf framework defaults."
+            )
+            logger.info(
+                f"mau_hidden: {args.mau_hidden}  "
+                f"filter_size: {args.mau_filter_size}  "
+                f"patch_size: {args.mau_patch_size}  "
+                f"stride: {args.mau_stride}  "
+                f"sr_size: {args.mau_sr_size}  "
+                f"tau: {args.mau_tau}  "
+                f"cell_mode: {args.mau_cell_mode}  "
+                f"model_mode: {args.mau_model_mode}  "
+                f"layer_norm: {args.mau_layer_norm}  "
+                f"scheduled_sampling: {args.scheduled_sampling}"
+            )
         if args.arch == "mim":
             logger.info(
                 "MIM keeps the OpenSTL recurrent loop and full-sequence MSE objective, "
@@ -1600,6 +1679,15 @@ def main():
         convlstm_patch_size=args.convlstm_patch_size,
         convlstm_stride=args.convlstm_stride,
         convlstm_layer_norm=args.convlstm_layer_norm,
+        mau_hidden=args.mau_hidden,
+        mau_filter_size=args.mau_filter_size,
+        mau_patch_size=args.mau_patch_size,
+        mau_stride=args.mau_stride,
+        mau_sr_size=args.mau_sr_size,
+        mau_tau=args.mau_tau,
+        mau_cell_mode=args.mau_cell_mode,
+        mau_model_mode=args.mau_model_mode,
+        mau_layer_norm=args.mau_layer_norm,
         mim_hidden=args.mim_hidden,
         mim_filter_size=args.mim_filter_size,
         mim_patch_size=args.mim_patch_size,
@@ -1787,6 +1875,24 @@ def main():
                             return_loss=True,
                         )
                         loss_local = pred.new_zeros(())
+                    elif uses_mau_openstl_loss(args):
+                        full_sequence = torch.cat([x, y], dim=1)
+                        predrnn_sampling_eta, mask_true = build_mau_real_input_flag(
+                            args=args,
+                            batch_size=x.size(0),
+                            channels=x.shape[2],
+                            height=x.shape[3],
+                            width=x.shape[4],
+                            device=device,
+                            eta=predrnn_sampling_eta,
+                            itr=global_step,
+                        )
+                        pred, loss = model(
+                            full_sequence,
+                            mask_true=mask_true,
+                            return_loss=True,
+                        )
+                        loss_local = pred.new_zeros(())
                     else:
                         pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
                         if uses_local_reconstruction_loss(args):
@@ -1888,6 +1994,12 @@ def main():
                             mse=f"{loss_mse.item():.6f}",
                         )
                     elif uses_mim_openstl_loss(args):
+                        iterator.set_postfix(
+                            loss=f"{loss.item():.6f}",
+                            mae=f"{loss_mae.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
+                        )
+                    elif uses_mau_openstl_loss(args):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mae=f"{loss_mae.item():.6f}",
@@ -2082,6 +2194,11 @@ def main():
                         f"train_mse: {train_mse:.4f}  decouple_beta: {args.predrnnv2_decouple_beta:.4f}"
                     )
                 elif uses_mim_openstl_loss(args):
+                    logger.info(
+                        f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                        f"train_mse: {train_mse:.4f}  arch: {args.arch}"
+                    )
+                elif uses_mau_openstl_loss(args):
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  arch: {args.arch}"

@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
 from .hybrid_unet_facts import HybridUNetFacTS
+from .mau_model import MAU_Model
 from .mim_model import MIM_Model
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
@@ -26,6 +27,7 @@ SUPPORTED_ARCHS = (
     "earthfarseer",
     "hybrid_unet_facts",
     "convlstm",
+    "mau",
     "mim",
     "predrnnpp",
     "predrnnv2",
@@ -87,6 +89,15 @@ class SimVPForecast(nn.Module):
         mim_patch_size: int = 4,
         mim_stride: int = 1,
         mim_layer_norm: bool = False,
+        mau_hidden: str = "64,64,64,64",
+        mau_filter_size: int = 5,
+        mau_patch_size: int = 1,
+        mau_stride: int = 1,
+        mau_sr_size: int = 4,
+        mau_tau: int = 5,
+        mau_cell_mode: str = "normal",
+        mau_model_mode: str = "normal",
+        mau_layer_norm: bool = True,
         predrnnpp_hidden: str = "128,128,128,128",
         predrnnpp_filter_size: int = 5,
         predrnnpp_patch_size: int = 4,
@@ -252,6 +263,30 @@ class SimVPForecast(nn.Module):
                 layer_norm=mim_layer_norm,
                 reverse_scheduled_sampling=self.reverse_scheduled_sampling,
             )
+        elif self.arch == "mau":
+            if self.reverse_scheduled_sampling:
+                raise ValueError(
+                    "MAU in simvp_spreadf does not support reverse_scheduled_sampling. "
+                    "Use standard scheduled sampling only."
+                )
+            if mau_stride != 1:
+                raise ValueError(
+                    "MAU in simvp_spreadf only supports mau_stride=1. "
+                    "stride>1 is not wired through the recurrent-state or decoder shapes."
+                )
+            self.backbone = MAU_Model(
+                shape_in=(in_T, C, H, W),
+                out_T=out_T,
+                num_hidden=mau_hidden,
+                filter_size=mau_filter_size,
+                patch_size=mau_patch_size,
+                stride=mau_stride,
+                sr_size=mau_sr_size,
+                tau=mau_tau,
+                cell_mode=mau_cell_mode,
+                model_mode=mau_model_mode,
+                layer_norm=mau_layer_norm,
+            )
         elif self.arch == "predrnnpp":
             if predrnnpp_stride != 1:
                 raise ValueError(
@@ -335,8 +370,10 @@ class SimVPForecast(nn.Module):
         x: [B, in_T, C, H, W]
         return: [B, out_T, C, H, W]
         """
-        if return_loss and self.arch not in ("mim", "predrnnpp", "predrnnv2"):
-            raise ValueError("return_loss is only supported for arch='mim', 'predrnnpp', or 'predrnnv2'.")
+        if return_loss and self.arch not in ("mau", "mim", "predrnnpp", "predrnnv2"):
+            raise ValueError(
+                "return_loss is only supported for arch='mau', 'mim', 'predrnnpp', or 'predrnnv2'."
+            )
 
         if self.arch == "hybrid_unet_facts":
             y = self.backbone(x, x_local=x_local, return_aux=return_aux, strict_local=strict_local)
@@ -362,6 +399,13 @@ class SimVPForecast(nn.Module):
                 return_loss=return_loss,
                 loss_target=loss_target,
             )
+        elif self.arch == "mau":
+            y = self.backbone(
+                x,
+                mask_true=mask_true,
+                return_loss=return_loss,
+                loss_target=loss_target,
+            )
         else:
             y = self.backbone(x)
         if self.arch in ("simvp", "tau"):
@@ -381,7 +425,7 @@ class SimVPForecast(nn.Module):
                 pred_chunks.append(cur_seq)
                 generated += cur_seq.shape[1]
             return torch.cat(pred_chunks, dim=1)[:, :self.out_T]
-        if self.arch in ("mim", "predrnnpp", "predrnnv2"):
+        if self.arch in ("mau", "mim", "predrnnpp", "predrnnv2"):
             # OpenSTL-style recurrent training can emit the whole rollout sequence so the
             # internal loss can compare against every predicted step. The public wrapper keeps
             # the rest of simvp_spreadf stable by exposing only the requested forecast tail.
