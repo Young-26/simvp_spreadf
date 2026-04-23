@@ -1,4 +1,5 @@
 import math
+from collections import deque
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ def _make_conv_norm_block(
     stride,
     padding,
     layer_norm,
+    conv_bias,
 ):
     conv = nn.Conv2d(
         in_channels,
@@ -23,7 +25,9 @@ def _make_conv_norm_block(
         kernel_size=kernel_size,
         stride=stride,
         padding=padding,
-        bias=not layer_norm,
+        # OpenSTL / official MAU keeps Conv2d bias even when LayerNorm follows it.
+        # Keep that as the default here so benchmark ports can match the upstream cell math.
+        bias=conv_bias,
     )
     if not layer_norm:
         return conv
@@ -42,6 +46,7 @@ class MAUCell(nn.Module):
         tau,
         cell_mode,
         layer_norm,
+        conv_bias,
     ):
         super().__init__()
 
@@ -64,6 +69,7 @@ class MAUCell(nn.Module):
             stride=stride,
             padding=self.padding,
             layer_norm=layer_norm,
+            conv_bias=conv_bias,
         )
         self.conv_t_next = _make_conv_norm_block(
             in_channel,
@@ -74,6 +80,7 @@ class MAUCell(nn.Module):
             stride=stride,
             padding=self.padding,
             layer_norm=layer_norm,
+            conv_bias=conv_bias,
         )
         self.conv_s = _make_conv_norm_block(
             self.num_hidden,
@@ -84,6 +91,7 @@ class MAUCell(nn.Module):
             stride=stride,
             padding=self.padding,
             layer_norm=layer_norm,
+            conv_bias=conv_bias,
         )
         self.conv_s_next = _make_conv_norm_block(
             self.num_hidden,
@@ -94,6 +102,7 @@ class MAUCell(nn.Module):
             stride=stride,
             padding=self.padding,
             layer_norm=layer_norm,
+            conv_bias=conv_bias,
         )
         self.softmax = nn.Softmax(dim=0)
 
@@ -142,6 +151,8 @@ class MAU_Model(nn.Module):
         cell_mode="normal",
         model_mode="normal",
         layer_norm=True,
+        loss_mode="future_only",
+        conv_bias=True,
     ):
         super().__init__()
         in_T, channels, height, width = shape_in
@@ -156,6 +167,11 @@ class MAU_Model(nn.Module):
         self.cell_mode = str(cell_mode).strip().lower()
         self.model_mode = str(model_mode).strip().lower()
         self.layer_norm = bool(layer_norm)
+        # Default to future_only in simvp_spreadf so MAU is benchmarked with the same
+        # forecasting target convention used by most other models in this repo. Set
+        # loss_mode='openstl_full' to reproduce OpenSTL's rollout-supervision objective.
+        self.loss_mode = str(loss_mode).strip().lower()
+        self.conv_bias = bool(conv_bias)
         self.num_hidden = _parse_num_hidden(num_hidden)
         self.num_layers = len(self.num_hidden)
         self.frame_channel = self.patch_size * self.patch_size * self.input_channels
@@ -186,6 +202,10 @@ class MAU_Model(nn.Module):
             raise ValueError(
                 f"Unsupported MAU model_mode '{model_mode}'. Available choices: ('recall', 'normal')."
             )
+        if self.loss_mode not in {"openstl_full", "future_only"}:
+            raise ValueError(
+                f"Unsupported MAU loss_mode '{loss_mode}'. Available choices: ('openstl_full', 'future_only')."
+            )
 
         patch_h = height // self.patch_size
         patch_w = width // self.patch_size
@@ -211,12 +231,13 @@ class MAU_Model(nn.Module):
                     width=state_w,
                     filter_size=filter_size,
                     stride=stride,
-                    tau=self.tau,
-                    cell_mode=self.cell_mode,
-                    layer_norm=self.layer_norm,
+                        tau=self.tau,
+                        cell_mode=self.cell_mode,
+                        layer_norm=self.layer_norm,
+                        conv_bias=self.conv_bias,
+                    )
                 )
-            )
-        self.cell_list = nn.ModuleList(cell_list)
+            self.cell_list = nn.ModuleList(cell_list)
 
         encoders = []
         encoder = nn.Sequential(
@@ -270,6 +291,9 @@ class MAU_Model(nn.Module):
         self.decoders = nn.ModuleList(decoders)
         self.srcnn = nn.Conv2d(self.num_hidden[-1], self.frame_channel, kernel_size=1, stride=1, padding=0)
 
+    def _new_history_buffer(self, state_template):
+        return deque((state_template.clone() for _ in range(self.tau)), maxlen=self.tau)
+
     def _mask_to_channel_first(self, mask_true, expected_steps, patch_h, patch_w):
         if expected_steps == 0:
             if mask_true is None:
@@ -304,10 +328,12 @@ class MAU_Model(nn.Module):
             f"Got {mask_true.shape} with expected patch grid {(patch_h, patch_w)} and channels {self.frame_channel}."
         )
 
-    def _resolve_openstl_loss_pair(self, next_frames, frames_tensor, loss_target):
+    def _resolve_loss_pair(self, next_frames, frames_tensor, loss_target):
         if loss_target is None:
             if frames_tensor.shape[1] == self.in_T + self.out_T:
-                return next_frames, frames_tensor[:, 1:]
+                if self.loss_mode == "openstl_full":
+                    return next_frames, frames_tensor[:, 1:]
+                return next_frames[:, -self.out_T :], frames_tensor[:, -self.out_T :]
             return None, None
 
         if loss_target.ndim != 5:
@@ -315,7 +341,9 @@ class MAU_Model(nn.Module):
         if loss_target.shape[0] != next_frames.shape[0] or loss_target.shape[2:] != next_frames.shape[2:]:
             raise ValueError(f"MAU loss_target shape {loss_target.shape} is incompatible with predictions {next_frames.shape}.")
         if loss_target.shape[1] == next_frames.shape[1]:
-            return next_frames, loss_target
+            if self.loss_mode == "openstl_full":
+                return next_frames, loss_target
+            return next_frames[:, -self.out_T :], loss_target[:, -self.out_T :]
         if loss_target.shape[1] == self.out_T:
             return next_frames[:, -self.out_T :], loss_target
         raise ValueError(
@@ -345,7 +373,7 @@ class MAU_Model(nn.Module):
 
         frames = reshape_patch(frames_tensor, self.patch_size)
         patch_h, patch_w = frames.shape[-2:]
-        expected_mask_steps = max(self.out_T - 1, 0) if in_steps == full_sequence_length else max(self.out_T - 1, 0)
+        expected_mask_steps = max(self.out_T - 1, 0)
         mask_true = self._mask_to_channel_first(mask_true, expected_mask_steps, patch_h, patch_w)
         if mask_true is None:
             mask_true = frames.new_zeros(batch, expected_mask_steps, self.frame_channel, patch_h, patch_w)
@@ -363,8 +391,8 @@ class MAU_Model(nn.Module):
             temporal_states.append(zeros)
             history_channels = self.num_hidden[layer_idx - 1] if layer_idx > 0 else self.num_hidden[0]
             history_zeros = frames.new_zeros(batch, history_channels, state_h, state_w)
-            temporal_buffers.append([history_zeros.clone() for _ in range(self.tau)])
-            spatial_buffers.append([history_zeros.clone() for _ in range(self.tau)])
+            temporal_buffers.append(self._new_history_buffer(history_zeros))
+            spatial_buffers.append(self._new_history_buffer(history_zeros))
 
         x_gen = None
         next_frames = []
@@ -386,8 +414,8 @@ class MAU_Model(nn.Module):
 
             spatial_state = frame_feature
             for layer_idx in range(self.num_layers):
-                t_att = torch.stack(temporal_buffers[layer_idx][-self.tau :], dim=0)
-                s_att = torch.stack(spatial_buffers[layer_idx][-self.tau :], dim=0)
+                t_att = torch.stack(tuple(temporal_buffers[layer_idx]), dim=0)
+                s_att = torch.stack(tuple(spatial_buffers[layer_idx]), dim=0)
                 spatial_buffers[layer_idx].append(spatial_state)
                 temporal_states[layer_idx], spatial_state = self.cell_list[layer_idx](
                     temporal_states[layer_idx],
@@ -411,7 +439,7 @@ class MAU_Model(nn.Module):
         next_frames = reshape_patch_back(next_frames, self.patch_size, self.input_channels)
 
         if return_loss:
-            loss_pred, loss_target = self._resolve_openstl_loss_pair(next_frames, frames_tensor, loss_target)
+            loss_pred, loss_target = self._resolve_loss_pair(next_frames, frames_tensor, loss_target)
             if loss_pred is None or loss_target is None:
                 raise ValueError(
                     "MAU needs either a full [x, y] sequence input or an explicit loss_target when return_loss=True."

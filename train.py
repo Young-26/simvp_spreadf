@@ -76,6 +76,10 @@ def is_tau_arch(args) -> bool:
     return str(args.arch).lower() == "tau"
 
 
+def get_mau_loss_mode(args) -> str:
+    return str(getattr(args, "mau_loss_mode", "future_only")).strip().lower()
+
+
 def uses_predrnnpp_openstl_recipe(args) -> bool:
     return is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "openstl"
 
@@ -88,7 +92,7 @@ def uses_mim_openstl_loss(args) -> bool:
     return is_mim_arch(args)
 
 
-def uses_mau_openstl_loss(args) -> bool:
+def uses_mau_internal_loss(args) -> bool:
     return is_mau_arch(args)
 
 
@@ -97,7 +101,7 @@ def uses_predrnn_openstl_sequence_loss(args) -> bool:
         uses_predrnnpp_openstl_recipe(args)
         or uses_predrnnv2_openstl_loss(args)
         or uses_mim_openstl_loss(args)
-        or uses_mau_openstl_loss(args)
+        or uses_mau_internal_loss(args)
     )
 
 
@@ -273,6 +277,22 @@ def build_parser():
     parser.add_argument("--mau_cell_mode", type=str, default="normal", choices=("normal", "residual"))
     parser.add_argument("--mau_model_mode", type=str, default="normal", choices=("normal", "recall"))
     parser.add_argument("--mau_layer_norm", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--mau_loss_mode",
+        type=str,
+        default="future_only",
+        choices=("openstl_full", "future_only"),
+        help=(
+            "MAU internal loss protocol. 'future_only' is the default here for fairer comparisons "
+            "with the rest of simvp_spreadf; use 'openstl_full' to match OpenSTL's rollout supervision."
+        ),
+    )
+    parser.add_argument(
+        "--mau_conv_bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep Conv2d bias enabled in MAU blocks by default to match the upstream OpenSTL implementation.",
+    )
     parser.add_argument("--predrnnpp_hidden", type=str, default="128,128,128,128")
     parser.add_argument("--predrnnpp_filter_size", type=int, default=5)
     parser.add_argument("--predrnnpp_patch_size", type=int, default=4)
@@ -913,8 +933,8 @@ def resolve_train_loss_mode(args, loss_weights=None):
         return f"mse_openstl + {float(args.predrnnv2_decouple_beta):.4f}*decouple"
     if uses_mim_openstl_loss(args):
         return "mse_openstl"
-    if uses_mau_openstl_loss(args):
-        return "mse_openstl"
+    if uses_mau_internal_loss(args):
+        return f"mse_{get_mau_loss_mode(args)}"
     if uses_simvp_moganet_openstl_loss(args):
         return "mae_openstl"
     if uses_earthfarseer_openstl_loss(args):
@@ -1508,8 +1528,8 @@ def main():
             )
         if args.arch == "mau":
             logger.info(
-                "MAU keeps the OpenSTL recurrent loop and full-sequence MSE objective, "
-                "but opt=auto/sched=auto here still mean simvp_spreadf framework defaults."
+                "MAU keeps the OpenSTL recurrent rollout and scheduled-sampling path, "
+                "but its supervision mode is explicit here so repo-level benchmarks can stay comparable."
             )
             logger.info(
                 f"mau_hidden: {args.mau_hidden}  "
@@ -1521,6 +1541,8 @@ def main():
                 f"cell_mode: {args.mau_cell_mode}  "
                 f"model_mode: {args.mau_model_mode}  "
                 f"layer_norm: {args.mau_layer_norm}  "
+                f"conv_bias: {args.mau_conv_bias}  "
+                f"loss_mode: {args.mau_loss_mode}  "
                 f"scheduled_sampling: {args.scheduled_sampling}"
             )
         if args.arch == "mim":
@@ -1688,6 +1710,8 @@ def main():
         mau_cell_mode=args.mau_cell_mode,
         mau_model_mode=args.mau_model_mode,
         mau_layer_norm=args.mau_layer_norm,
+        mau_loss_mode=args.mau_loss_mode,
+        mau_conv_bias=args.mau_conv_bias,
         mim_hidden=args.mim_hidden,
         mim_filter_size=args.mim_filter_size,
         mim_patch_size=args.mim_patch_size,
@@ -1875,7 +1899,7 @@ def main():
                             return_loss=True,
                         )
                         loss_local = pred.new_zeros(())
-                    elif uses_mau_openstl_loss(args):
+                    elif uses_mau_internal_loss(args):
                         full_sequence = torch.cat([x, y], dim=1)
                         predrnn_sampling_eta, mask_true = build_mau_real_input_flag(
                             args=args,
@@ -1999,7 +2023,7 @@ def main():
                             mae=f"{loss_mae.item():.6f}",
                             mse=f"{loss_mse.item():.6f}",
                         )
-                    elif uses_mau_openstl_loss(args):
+                    elif uses_mau_internal_loss(args):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             mae=f"{loss_mae.item():.6f}",
@@ -2198,10 +2222,10 @@ def main():
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
                         f"train_mse: {train_mse:.4f}  arch: {args.arch}"
                     )
-                elif uses_mau_openstl_loss(args):
+                elif uses_mau_internal_loss(args):
                     logger.info(
                         f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
-                        f"train_mse: {train_mse:.4f}  arch: {args.arch}"
+                        f"train_mse: {train_mse:.4f}  loss_mode: {args.mau_loss_mode}"
                     )
                 elif is_tau_arch(args):
                     logger.info(

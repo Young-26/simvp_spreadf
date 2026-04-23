@@ -218,6 +218,8 @@ def build_forecast_model_kwargs_from_config(
         "mau_cell_mode": str(config.get("mau_cell_mode", "normal")),
         "mau_model_mode": str(config.get("mau_model_mode", "normal")),
         "mau_layer_norm": bool(config.get("mau_layer_norm", True)),
+        "mau_loss_mode": str(config.get("mau_loss_mode", "future_only")),
+        "mau_conv_bias": bool(config.get("mau_conv_bias", True)),
         "predrnnpp_hidden": str(config.get("predrnnpp_hidden", "128,128,128,128")),
         "predrnnpp_filter_size": int(config.get("predrnnpp_filter_size", 5)),
         "predrnnpp_patch_size": int(config.get("predrnnpp_patch_size", 4)),

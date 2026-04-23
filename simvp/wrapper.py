@@ -98,6 +98,8 @@ class SimVPForecast(nn.Module):
         mau_cell_mode: str = "normal",
         mau_model_mode: str = "normal",
         mau_layer_norm: bool = True,
+        mau_loss_mode: str = "future_only",
+        mau_conv_bias: bool = True,
         predrnnpp_hidden: str = "128,128,128,128",
         predrnnpp_filter_size: int = 5,
         predrnnpp_patch_size: int = 4,
@@ -286,6 +288,8 @@ class SimVPForecast(nn.Module):
                 cell_mode=mau_cell_mode,
                 model_mode=mau_model_mode,
                 layer_norm=mau_layer_norm,
+                loss_mode=mau_loss_mode,
+                conv_bias=mau_conv_bias,
             )
         elif self.arch == "predrnnpp":
             if predrnnpp_stride != 1:

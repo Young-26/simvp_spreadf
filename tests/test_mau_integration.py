@@ -2,6 +2,7 @@ import unittest
 from argparse import Namespace
 
 import torch
+import torch.nn.functional as F
 
 import train as train_lib
 from simvp.mau_model import MAU_Model
@@ -65,6 +66,25 @@ class MAUIntegrationTests(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(model.srcnn.weight.grad)
 
+    def test_loss_mode_switches_supervision_protocol(self):
+        torch.manual_seed(3456)
+        model_full = self._make_backbone(loss_mode="openstl_full")
+        model_future = self._make_backbone(loss_mode="future_only")
+        model_future.load_state_dict(model_full.state_dict(), strict=True)
+
+        full_sequence = torch.randn(2, 10, 1, 64, 64)
+        mask_true = torch.zeros(2, 1, 32, 32, 4)
+
+        pred_full, loss_full = model_full(full_sequence, mask_true=mask_true, return_loss=True)
+        pred_future, loss_future = model_future(full_sequence, mask_true=mask_true, return_loss=True)
+
+        manual_full = F.mse_loss(pred_full, full_sequence[:, 1:])
+        manual_future = F.mse_loss(pred_future[:, -2:], full_sequence[:, -2:])
+
+        torch.testing.assert_close(pred_full, pred_future)
+        torch.testing.assert_close(loss_full, manual_full)
+        torch.testing.assert_close(loss_future, manual_future)
+
     def test_real_input_flag_shapes_follow_patch_grid(self):
         args = Namespace(
             in_T=8,
@@ -102,6 +122,22 @@ class MAUIntegrationTests(unittest.TestCase):
     def test_non_power_of_two_sr_size_raises(self):
         with self.assertRaisesRegex(ValueError, "power of two"):
             self._make_backbone(sr_size=3)
+
+    def test_history_buffer_uses_fixed_maxlen(self):
+        model = self._make_backbone(tau=2)
+        template = torch.zeros(1, 8, 8, 8)
+        buffer = model._new_history_buffer(template)
+
+        self.assertEqual(buffer.maxlen, 2)
+        for value in range(5):
+            buffer.append(torch.full_like(template, float(value)))
+        self.assertEqual(len(buffer), 2)
+        self.assertTrue(torch.equal(buffer[0], torch.full_like(template, 3.0)))
+        self.assertTrue(torch.equal(buffer[1], torch.full_like(template, 4.0)))
+
+    def test_default_conv_bias_matches_upstream_mau(self):
+        model = self._make_backbone(layer_norm=True, conv_bias=True)
+        self.assertIsNotNone(model.cell_list[0].conv_t[0].bias)
 
 
 if __name__ == "__main__":
