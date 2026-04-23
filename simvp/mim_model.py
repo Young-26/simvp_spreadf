@@ -98,6 +98,9 @@ class SpatioTemporalLSTMCell(nn.Module):
                 bias=False,
             )
 
+        # Kept for structural parity with OpenSTL's reference MIMN module. The original code
+        # registers this projection but does not consume it in forward(), so DDP must tolerate
+        # unused parameters when training MIM on multiple GPUs.
         self.conv_last = nn.Conv2d(
             num_hidden * 2,
             num_hidden,

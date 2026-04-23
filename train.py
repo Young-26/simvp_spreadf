@@ -162,8 +162,10 @@ def get_default_weighted_reconstruction_loss_weights(args) -> dict:
 
 def should_enable_ddp_find_unused_parameters(args) -> bool:
     # OpenSTL's PredRNN++ reference cell registers conv_o but does not consume it in forward().
-    # DDP therefore needs unused-parameter detection for PredRNN++ training on multiple GPUs.
-    return is_predrnnpp_arch(args)
+    # MIM likewise keeps OpenSTL's MIMN helper structure, whose conv_last parameters are registered
+    # but intentionally not consumed in the current forward path. DDP therefore needs unused-parameter
+    # detection for both ports to avoid reduction hangs on multi-GPU runs.
+    return is_predrnnpp_arch(args) or is_mim_arch(args)
 
 
 def resolve_recipe_tag(args) -> str:

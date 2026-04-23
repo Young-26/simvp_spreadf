@@ -219,6 +219,10 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(args.warmup_epoch, 0)
         self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
 
+    def test_mim_requires_ddp_find_unused_parameters(self):
+        args = self._make_train_args(arch="mim", mim_hidden="8,8,8,8")
+        self.assertTrue(train_lib.should_enable_ddp_find_unused_parameters(args))
+
     def test_predformer_facts_uses_mae_openstl_loss_mode(self):
         args = self._make_train_args(arch="predformer_facts", simvp_model_type="gsta", simvp_recipe="openstl")
 
