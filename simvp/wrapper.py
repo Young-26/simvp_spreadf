@@ -126,6 +126,7 @@ class SimVPForecast(nn.Module):
         predformer_drop_path: float = 0.0,
         predformer_scale_dim: int = 4,
         predformer_depth: int = 4,
+        predformer_transformer_depth: int = 1,
         arch: str = "simvp",
         hybrid_depth: int = 2,
         hybrid_heads: int = 8,
@@ -345,8 +346,9 @@ class SimVPForecast(nn.Module):
             )
         elif self.arch == "predformer_quadruplet_tsst":
             # Keep the public predformer_depth knob for compatibility. In the local TSST port
-            # it maps to the number of stacked TSST blocks, while each internal transformer
-            # keeps the upstream single-block depth.
+            # it maps to the number of stacked Quadruplet-TSST layers (official PredFormer's
+            # Ndepth), while predformer_transformer_depth controls the depth inside each
+            # GatedTransformer branch. Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.
             self.backbone = PredFormerQuadrupletTSST_Model(
                 shape_in=(in_T, C, H, W),
                 patch_size=predformer_patch_size,
@@ -358,6 +360,7 @@ class SimVPForecast(nn.Module):
                 drop_path=predformer_drop_path,
                 scale_dim=predformer_scale_dim,
                 depth=predformer_depth,
+                transformer_depth=predformer_transformer_depth,
             )
         elif self.arch == "hybrid_unet_facts":
             self.backbone = HybridUNetFacTS(

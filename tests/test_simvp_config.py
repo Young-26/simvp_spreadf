@@ -42,7 +42,9 @@ class SimVPConfigTests(unittest.TestCase):
             simvp_model_type="gsta",
             simvp_recipe="openstl",
             predrnnpp_recipe="simvp",
-            predformer_loss="mae",
+            predformer_loss="mse",
+            predformer_recipe="auto",
+            predformer_transformer_depth=1,
             opt="auto",
             sched="auto",
             warmup_epoch=3,
@@ -51,8 +53,11 @@ class SimVPConfigTests(unittest.TestCase):
             N_S=4,
             N_T=4,
             lr=2e-4,
+            weight_decay=1e-4,
             batch_size=4,
             simvp_drop_path=0.1,
+            train_manifest="train.jsonl",
+            val_manifest="val.jsonl",
         )
         base.update(overrides)
         return Namespace(**base)
@@ -81,6 +86,10 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(_get_action_choices(infer_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(predict_lib.build_parser(), "simvp_recipe"), SIMVP_RECIPE_CHOICES)
         self.assertEqual(_get_action_choices(train_lib.build_parser(), "predformer_loss"), ("mae", "mse", "hybrid"))
+        self.assertEqual(
+            _get_action_choices(train_lib.build_parser(), "predformer_recipe"),
+            ("auto", "generic", "mmnist", "taxibj", "human", "weather"),
+        )
 
     def test_train_parser_documents_mim_constraints(self):
         parser = train_lib.build_parser()
@@ -223,35 +232,38 @@ class SimVPConfigTests(unittest.TestCase):
         args = self._make_train_args(arch="mim", mim_hidden="8,8,8,8")
         self.assertTrue(train_lib.should_enable_ddp_find_unused_parameters(args))
 
-    def test_predformer_facts_uses_mae_openstl_loss_mode(self):
+    def test_predformer_facts_uses_mse_openstl_loss_mode_by_default(self):
         args = self._make_train_args(arch="predformer_facts", simvp_model_type="gsta", simvp_recipe="openstl")
 
+        self.assertTrue(train_lib.uses_predformer_openstl_loss(args))
         self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
-        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
 
-    def test_predformer_quadruplet_tsst_uses_mae_openstl_loss_mode(self):
+    def test_predformer_quadruplet_tsst_uses_mse_openstl_loss_mode_by_default(self):
         args = self._make_train_args(
             arch="predformer_quadruplet_tsst",
             simvp_model_type="gsta",
             simvp_recipe="openstl",
         )
 
+        self.assertTrue(train_lib.uses_predformer_openstl_loss(args))
         self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
-        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
 
-    def test_predformer_facts_supports_mse_openstl_loss_mode(self):
+    def test_predformer_facts_supports_mae_openstl_loss_mode(self):
         args = self._make_train_args(
             arch="predformer_facts",
             simvp_model_type="gsta",
             simvp_recipe="openstl",
-            predformer_loss="mse",
+            predformer_loss="mae",
         )
 
+        self.assertTrue(train_lib.uses_predformer_openstl_loss(args))
         self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
-        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mse_openstl")
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
 
     def test_predformer_facts_supports_hybrid_loss_mode(self):
         args = self._make_train_args(
@@ -264,6 +276,71 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
         self.assertEqual(train_lib.resolve_train_loss_mode(args), "0.8000*MAE + 0.2000*MSE")
+
+    def test_predformer_generic_recipe_resolves_auto_optimizer_scheduler_and_defaults(self):
+        args = self._make_train_args(
+            arch="predformer_quadruplet_tsst",
+            predformer_recipe="generic",
+            predformer_loss="mae",
+            weight_decay=1e-4,
+        )
+        args = train_lib.apply_predformer_recipe_defaults(args, explicit_cli_args=set())
+        args = train_lib.resolve_optimizer_config(args)
+        args = train_lib.resolve_scheduler_config(args)
+
+        self.assertEqual(train_lib.get_predformer_recipe(args), "generic")
+        self.assertEqual(args.opt, "adamw")
+        self.assertEqual(args.sched, "onecycle")
+        self.assertEqual(args.weight_decay, 1e-2)
+        self.assertEqual(args.predformer_loss, "mse")
+        self.assertEqual(args.warmup_epoch, 0)
+
+    def test_predformer_human_recipe_resolves_auto_cosine_scheduler_and_defaults(self):
+        args = self._make_train_args(
+            arch="predformer_quadruplet_tsst",
+            predformer_recipe="human",
+            predformer_loss="mae",
+            weight_decay=1e-4,
+        )
+        args = train_lib.apply_predformer_recipe_defaults(args, explicit_cli_args=set())
+        args = train_lib.resolve_optimizer_config(args)
+        args = train_lib.resolve_scheduler_config(args)
+
+        self.assertEqual(train_lib.get_predformer_recipe(args), "human")
+        self.assertEqual(args.opt, "adamw")
+        self.assertEqual(args.sched, "cosine")
+        self.assertEqual(args.weight_decay, 1e-2)
+        self.assertEqual(args.predformer_loss, "mse")
+        self.assertEqual(args.warmup_epoch, 0)
+
+    def test_predformer_recipe_auto_infers_dataset_from_manifest_paths(self):
+        args = self._make_train_args(
+            arch="predformer_quadruplet_tsst",
+            predformer_recipe="auto",
+            train_manifest="manifests/human/train.jsonl",
+            val_manifest="manifests/human/val.jsonl",
+        )
+        self.assertEqual(train_lib.get_predformer_recipe(args), "human")
+
+        args = train_lib.apply_predformer_recipe_defaults(args, explicit_cli_args=set())
+        args = train_lib.resolve_optimizer_config(args)
+        args = train_lib.resolve_scheduler_config(args)
+        self.assertEqual(args.sched, "cosine")
+
+    def test_predformer_recipe_defaults_respect_explicit_overrides(self):
+        args = self._make_train_args(
+            arch="predformer_quadruplet_tsst",
+            predformer_recipe="human",
+            predformer_loss="hybrid",
+            weight_decay=5e-4,
+        )
+        args = train_lib.apply_predformer_recipe_defaults(
+            args,
+            explicit_cli_args={"predformer_loss", "weight_decay"},
+        )
+
+        self.assertEqual(args.predformer_loss, "hybrid")
+        self.assertEqual(args.weight_decay, 5e-4)
 
     def test_explicit_simvp_recipe_overrides_take_priority(self):
         args = self._make_train_args(
@@ -348,6 +425,7 @@ class SimVPConfigTests(unittest.TestCase):
 
     def test_canonical_choices_remain_small_and_stable(self):
         self.assertEqual(SIMVP_MODEL_TYPE_CHOICES, ("incepu", "gsta", "moganet"))
+        self.assertIn("predformer_quadruplet_tsst", SUPPORTED_ARCHS)
 
     def test_build_forecast_model_kwargs_includes_predformer_facts_fields(self):
         model_kwargs, metadata = build_forecast_model_kwargs_from_config(
@@ -364,6 +442,7 @@ class SimVPConfigTests(unittest.TestCase):
                 "predformer_drop_path": 0.3,
                 "predformer_scale_dim": 2,
                 "predformer_depth": 3,
+                "predformer_transformer_depth": 1,
             },
             image_mode="L",
             image_size=32,
@@ -378,6 +457,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(model_kwargs["predformer_drop_path"], 0.3)
         self.assertEqual(model_kwargs["predformer_scale_dim"], 2)
         self.assertEqual(model_kwargs["predformer_depth"], 3)
+        self.assertEqual(model_kwargs["predformer_transformer_depth"], 1)
 
     def test_build_forecast_model_kwargs_allows_predformer_cli_overrides(self):
         model_kwargs, _ = build_forecast_model_kwargs_from_config(
@@ -394,6 +474,7 @@ class SimVPConfigTests(unittest.TestCase):
                 "predformer_heads": 4,
                 "predformer_dim_head": 16,
                 "predformer_depth": 2,
+                "predformer_transformer_depth": 2,
             },
         )
         self.assertEqual(model_kwargs["predformer_patch_size"], 8)
@@ -401,6 +482,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(model_kwargs["predformer_heads"], 4)
         self.assertEqual(model_kwargs["predformer_dim_head"], 16)
         self.assertEqual(model_kwargs["predformer_depth"], 2)
+        self.assertEqual(model_kwargs["predformer_transformer_depth"], 2)
 
     def test_build_forecast_model_kwargs_supports_predformer_quadruplet_tsst(self):
         model_kwargs, metadata = build_forecast_model_kwargs_from_config(
@@ -413,11 +495,13 @@ class SimVPConfigTests(unittest.TestCase):
                 "predformer_heads": 4,
                 "predformer_dim_head": 16,
                 "predformer_depth": 2,
+                "predformer_transformer_depth": 2,
             },
             image_mode="L",
             image_size=32,
         )
         self.assertEqual(metadata["arch"], "predformer_quadruplet_tsst")
+        self.assertEqual(model_kwargs["predformer_transformer_depth"], 2)
         model = SimVPForecast(**model_kwargs)
         x = torch.randn(1, 4, 1, 32, 32)
         self.assertEqual(tuple(model(x).shape), (1, 2, 1, 32, 32))

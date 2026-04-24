@@ -1,4 +1,5 @@
 import math
+from numbers import Integral
 
 import torch
 from torch import nn
@@ -14,6 +15,49 @@ def _init_linear_and_layernorm(module: nn.Module):
     elif isinstance(module, nn.LayerNorm):
         nn.init.constant_(module.bias, 0)
         nn.init.constant_(module.weight, 1.0)
+
+
+def _require_positive_int(name: str, value, model_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+        raise ValueError(f"{model_name} expects {name} to be a positive integer, but got {value!r}.")
+    return int(value)
+
+
+def _validate_shape_in(shape_in, model_name: str):
+    if not isinstance(shape_in, (tuple, list)) or len(shape_in) != 4:
+        raise ValueError(f"{model_name} expects shape_in=(T, C, H, W), but got {shape_in!r}.")
+    steps, channels, height, width = shape_in
+    return (
+        _require_positive_int("T", steps, model_name),
+        _require_positive_int("C", channels, model_name),
+        _require_positive_int("H", height, model_name),
+        _require_positive_int("W", width, model_name),
+    )
+
+
+def _recover_from_patch_tokens(
+    x: torch.Tensor,
+    *,
+    batch_size: int,
+    steps: int,
+    patches_h: int,
+    patches_w: int,
+    channels: int,
+    patch_size: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    x = x.reshape(
+        batch_size,
+        steps,
+        patches_h,
+        patches_w,
+        channels,
+        patch_size,
+        patch_size,
+    )
+    x = x.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
+    return x.reshape(batch_size, steps, channels, height, width)
 
 
 class PreNorm(nn.Module):
@@ -44,7 +88,7 @@ class Attention(nn.Module):
         batch_size, seq_len, _ = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = [
-            tensor.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2).contiguous()
+            tensor.reshape(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2).contiguous()
             for tensor in qkv
         ]
 
@@ -120,18 +164,26 @@ def sinusoidal_embedding(num_positions: int, dim: int) -> torch.Tensor:
 class PatchEmbed(nn.Module):
     def __init__(self, channels: int, patch_size: int, dim: int):
         super().__init__()
-        self.channels = int(channels)
-        self.patch_size = int(patch_size)
-        self.proj = nn.Linear(self.channels * self.patch_size * self.patch_size, dim)
+        self.channels = _require_positive_int("channels", channels, "PatchEmbed")
+        self.patch_size = _require_positive_int("patch_size", patch_size, "PatchEmbed")
+        self.proj = nn.Linear(
+            self.channels * self.patch_size * self.patch_size,
+            _require_positive_int("dim", dim, "PatchEmbed"),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, steps, channels, height, width = x.shape
         patch_size = self.patch_size
+        if height % patch_size != 0 or width % patch_size != 0:
+            raise ValueError(
+                f"PatchEmbed requires H and W divisible by patch_size, but got "
+                f"H={height}, W={width}, patch_size={patch_size}."
+            )
         patches_h = height // patch_size
         patches_w = width // patch_size
-        x = x.view(batch_size, steps, channels, patches_h, patch_size, patches_w, patch_size)
+        x = x.reshape(batch_size, steps, channels, patches_h, patch_size, patches_w, patch_size)
         x = x.permute(0, 1, 3, 5, 4, 6, 2).contiguous()
-        x = x.view(batch_size, steps, patches_h * patches_w, channels * patch_size * patch_size)
+        x = x.reshape(batch_size, steps, patches_h * patches_w, channels * patch_size * patch_size)
         return self.proj(x)
 
 
@@ -152,18 +204,26 @@ class PredFormerFacTS_Model(nn.Module):
         depth: int = 4,
     ):
         super().__init__()
-        steps, channels, height, width = shape_in
+        model_name = "PredFormer_FacTS"
+        steps, channels, height, width = _validate_shape_in(shape_in, model_name)
+        patch_size = _require_positive_int("patch_size", patch_size, model_name)
+        dim = _require_positive_int("dim", dim, model_name)
+        heads = _require_positive_int("heads", heads, model_name)
+        dim_head = _require_positive_int("dim_head", dim_head, model_name)
+        scale_dim = _require_positive_int("scale_dim", scale_dim, model_name)
+        shared_depth = _require_positive_int("depth", depth, model_name)
         if height % patch_size != 0 or width % patch_size != 0:
             raise ValueError(
-                f"PredFormer_FacTS requires H/W divisible by patch_size, got {(height, width)} and patch_size={patch_size}."
+                f"{model_name} requires H and W divisible by patch_size, but got "
+                f"H={height}, W={width}, patch_size={patch_size}."
             )
 
-        self.steps = int(steps)
-        self.channels = int(channels)
-        self.height = int(height)
-        self.width = int(width)
-        self.patch_size = int(patch_size)
-        self.dim = int(dim)
+        self.steps = steps
+        self.channels = channels
+        self.height = height
+        self.width = width
+        self.patch_size = patch_size
+        self.dim = dim
         self.patches_h = self.height // self.patch_size
         self.patches_w = self.width // self.patch_size
         self.num_patches = self.patches_h * self.patches_w
@@ -176,9 +236,8 @@ class PredFormerFacTS_Model(nn.Module):
         )
 
         # Keep the public predformer_depth setting compatible with existing CLI/config usage.
-        # In this FacTS port it is a shared stack depth used by both transformer branches.
-        shared_depth = int(depth)
-        mlp_dim = self.dim * int(scale_dim)
+        # In this FacTS port it is the shared temporal/spatial transformer depth.
+        mlp_dim = self.dim * scale_dim
         self.temporal_transformer = GatedTransformer(
             self.dim,
             depth=shared_depth,
@@ -223,22 +282,22 @@ class PredFormerFacTS_Model(nn.Module):
             pos_embedding = pos_embedding.to(dtype=x.dtype)
         x = x + pos_embedding
 
-        x_t = x.permute(0, 2, 1, 3).contiguous().view(batch_size * self.num_patches, steps, self.dim)
+        x_t = x.permute(0, 2, 1, 3).contiguous().reshape(batch_size * self.num_patches, steps, self.dim)
         x_t = self.temporal_transformer(x_t)
 
-        x_ts = x_t.view(batch_size, self.num_patches, steps, self.dim).permute(0, 2, 1, 3).contiguous()
-        x_ts = x_ts.view(batch_size * steps, self.num_patches, self.dim)
+        x_ts = x_t.reshape(batch_size, self.num_patches, steps, self.dim).permute(0, 2, 1, 3).contiguous()
+        x_ts = x_ts.reshape(batch_size * steps, self.num_patches, self.dim)
         x_ts = self.spatial_transformer(x_ts)
 
-        x = self.head(x_ts.view(batch_size, steps, self.num_patches, self.dim).reshape(-1, self.dim))
-        x = x.view(
-            batch_size,
-            steps,
-            self.patches_h,
-            self.patches_w,
-            self.channels,
-            self.patch_size,
-            self.patch_size,
+        x = self.head(x_ts.reshape(batch_size, steps, self.num_patches, self.dim).reshape(-1, self.dim))
+        return _recover_from_patch_tokens(
+            x,
+            batch_size=batch_size,
+            steps=steps,
+            patches_h=self.patches_h,
+            patches_w=self.patches_w,
+            channels=self.channels,
+            patch_size=self.patch_size,
+            height=self.height,
+            width=self.width,
         )
-        x = x.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
-        return x.view(batch_size, steps, self.channels, self.height, self.width)

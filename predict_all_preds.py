@@ -91,7 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--predformer_depth",
         type=int,
         default=None,
-        help="For predformer_facts this is the shared temporal/spatial stack depth. For predformer_quadruplet_tsst it is the number of stacked TSST blocks.",
+        help="For predformer_facts this is the shared temporal/spatial stack depth. For predformer_quadruplet_tsst it is the number of Quadruplet-TSST layers (official Ndepth). Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.",
+    )
+    parser.add_argument(
+        "--predformer_transformer_depth",
+        type=int,
+        default=None,
+        help="Depth inside each GatedTransformer branch for predformer_quadruplet_tsst only. FacTS ignores this. Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.",
     )
     parser.add_argument("--image_mode", type=str, default=None, choices=["L", "RGB"])
     parser.add_argument("--image_size", type=int, default=None)
@@ -698,6 +704,7 @@ def main() -> None:
         "predformer_drop_path": args.predformer_drop_path,
         "predformer_scale_dim": args.predformer_scale_dim,
         "predformer_depth": args.predformer_depth,
+        "predformer_transformer_depth": args.predformer_transformer_depth,
         "use_local_branch": args.use_local_branch,
         "local_top": args.local_top,
         "local_bottom": args.local_bottom,

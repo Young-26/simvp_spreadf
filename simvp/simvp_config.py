@@ -253,8 +253,13 @@ def build_forecast_model_kwargs_from_config(
         ),
         # predformer_depth keeps the public config name for both local PredFormer ports.
         # FacTS interprets it as the shared temporal/spatial stack depth, while the
-        # Quadruplet_TSST port uses it as the number of stacked TSST blocks.
+        # Quadruplet_TSST port uses it as the number of stacked TSST layers (official Ndepth).
         "predformer_depth": int(_coalesce(overrides.get("predformer_depth"), config.get("predformer_depth"), 4)),
+        # Only used by predformer_quadruplet_tsst. It matches the official PredFormer `depth`
+        # inside each GatedTransformer branch. Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.
+        "predformer_transformer_depth": int(
+            _coalesce(overrides.get("predformer_transformer_depth"), config.get("predformer_transformer_depth"), 1)
+        ),
         "arch": arch,
         "hybrid_depth": int(config.get("hybrid_depth", 2)),
         "hybrid_heads": int(config.get("hybrid_heads", 8)),

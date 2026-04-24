@@ -36,6 +36,76 @@ from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
 
 
+PREDFORMER_ARCHS = (
+    "predformer_facts",
+    "predformer_quadruplet_tsst",
+)
+
+PREDFORMER_RECIPE_CHOICES = (
+    "auto",
+    "generic",
+    "mmnist",
+    "taxibj",
+    "human",
+    "weather",
+)
+
+PREDFORMER_TRAIN_PRESETS = {
+    "generic": {
+        "weight_decay": 1e-2,
+        "predformer_loss": "mse",
+    },
+    "mmnist": {
+        "weight_decay": 1e-2,
+        "predformer_loss": "mse",
+    },
+    "taxibj": {
+        "weight_decay": 1e-2,
+        "predformer_loss": "mse",
+    },
+    "human": {
+        "weight_decay": 1e-2,
+        "predformer_loss": "mse",
+    },
+    "weather": {
+        "weight_decay": 1e-2,
+        "predformer_loss": "mse",
+    },
+}
+
+
+def normalize_predformer_recipe(recipe) -> str:
+    recipe = str("auto" if recipe is None else recipe).strip().lower()
+    if recipe not in PREDFORMER_RECIPE_CHOICES:
+        raise ValueError(
+            f"Unsupported predformer_recipe '{recipe}'. Available choices: {PREDFORMER_RECIPE_CHOICES}."
+        )
+    return recipe
+
+
+def _infer_predformer_recipe_from_paths(*paths: str) -> str:
+    joined = " ".join(str(path).strip().lower() for path in paths if path is not None)
+    if any(token in joined for token in ("movingmnist", "moving_mnist", "moving-mnist", "mmnist")):
+        return "mmnist"
+    if any(token in joined for token in ("taxibj", "taxi")):
+        return "taxibj"
+    if any(token in joined for token in ("human3.6", "human36", "human3d", "human")):
+        return "human"
+    if any(token in joined for token in ("weatherbench", "weather")):
+        return "weather"
+    return "generic"
+
+
+def get_predformer_recipe(args) -> str:
+    recipe = normalize_predformer_recipe(getattr(args, "predformer_recipe", "auto"))
+    if recipe != "auto":
+        return recipe
+    return _infer_predformer_recipe_from_paths(
+        getattr(args, "train_manifest", ""),
+        getattr(args, "val_manifest", ""),
+    )
+
+
 def get_predrnnpp_recipe(args) -> str:
     return normalize_predrnnpp_recipe(getattr(args, "predrnnpp_recipe", "simvp"))
 
@@ -74,6 +144,10 @@ def is_mau_arch(args) -> bool:
 
 def is_tau_arch(args) -> bool:
     return str(args.arch).lower() == "tau"
+
+
+def is_predformer_arch(args) -> bool:
+    return str(getattr(args, "arch", "simvp")).lower() in PREDFORMER_ARCHS
 
 
 def get_mau_loss_mode(args) -> str:
@@ -127,17 +201,19 @@ def uses_earthfarseer_openstl_loss(args) -> bool:
     return str(getattr(args, "arch", "simvp")).lower() == "earthfarseer"
 
 
-def uses_predformer_facts_openstl_loss(args) -> bool:
+def uses_predformer_openstl_loss(args) -> bool:
     # The local PredFormer ports follow an OpenSTL-style direct prediction objective.
     # The concrete loss type is selected via --predformer_loss.
-    return str(getattr(args, "arch", "simvp")).lower() in (
-        "predformer_facts",
-        "predformer_quadruplet_tsst",
-    )
+    return is_predformer_arch(args)
+
+
+def uses_predformer_facts_openstl_loss(args) -> bool:
+    # Backward-compatible alias for older tests/scripts that still use the old helper name.
+    return uses_predformer_openstl_loss(args)
 
 
 def get_predformer_loss(args) -> str:
-    loss_name = str(getattr(args, "predformer_loss", "mae")).strip().lower()
+    loss_name = str(getattr(args, "predformer_loss", "mse")).strip().lower()
     if loss_name not in ("mae", "mse", "hybrid"):
         raise ValueError(
             f"Unsupported predformer_loss '{loss_name}'. Available choices: ('mae', 'mse', 'hybrid')."
@@ -154,7 +230,7 @@ def uses_local_reconstruction_loss(args) -> bool:
     return (
         not uses_simvp_moganet_openstl_loss(args)
         and not uses_earthfarseer_openstl_loss(args)
-        and not uses_predformer_facts_openstl_loss(args)
+        and not uses_predformer_openstl_loss(args)
         and
         not uses_weighted_reconstruction_loss(args)
         and not uses_predrnn_openstl_sequence_loss(args)
@@ -193,6 +269,8 @@ def resolve_recipe_tag(args) -> str:
         return "openstl"
     if is_mau_arch(args):
         return "openstl"
+    if is_predformer_arch(args):
+        return get_predformer_recipe(args)
     if str(args.arch).lower() == "simvp":
         return get_effective_simvp_recipe_from_args(args)
     return "default"
@@ -348,14 +426,32 @@ def build_parser():
         "--predformer_depth",
         type=int,
         default=4,
-        help="For predformer_facts this is the shared temporal/spatial stack depth. For predformer_quadruplet_tsst it is the number of stacked TSST blocks.",
+        help="For predformer_facts this is the shared temporal/spatial stack depth. For predformer_quadruplet_tsst it is the number of Quadruplet-TSST layers (official Ndepth). Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.",
+    )
+    parser.add_argument(
+        "--predformer_transformer_depth",
+        type=int,
+        default=1,
+        help="Depth inside each GatedTransformer branch for predformer_quadruplet_tsst only. FacTS ignores this. Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.",
+    )
+    parser.add_argument(
+        "--predformer_recipe",
+        type=str,
+        default="auto",
+        choices=PREDFORMER_RECIPE_CHOICES,
+        help=(
+            "PredFormer training recipe preset. generic/mmnist/taxibj/human/weather apply AdamW-style "
+            "defaults such as weight_decay=1e-2 and predformer_loss=mse. With sched=auto, mmnist/taxibj "
+            "map to OneCycle and human/weather map to Cosine. auto tries to infer the dataset from "
+            "manifest paths and falls back to generic."
+        ),
     )
     parser.add_argument(
         "--predformer_loss",
         type=str,
-        default="mae",
+        default="mse",
         choices=("mae", "mse", "hybrid"),
-        help="Training loss for PredFormer arches. Use 'hybrid' for 0.8*L1 + 0.2*MSE.",
+        help="Training loss for PredFormer arches. Defaults to mse to match the official PredFormer configs. Use 'hybrid' for 0.8*L1 + 0.2*MSE.",
     )
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
@@ -469,6 +565,20 @@ def apply_simvp_recipe_defaults(args, explicit_cli_args=None):
     for field, value in SIMVP_OPENSTL_TRAIN_PRESET.items():
         if field in ("opt", "sched"):
             continue
+        if field not in explicit_cli_args:
+            setattr(args, field, value)
+    return args
+
+
+def apply_predformer_recipe_defaults(args, explicit_cli_args=None):
+    explicit_cli_args = set() if explicit_cli_args is None else set(explicit_cli_args)
+    args.predformer_recipe = normalize_predformer_recipe(getattr(args, "predformer_recipe", "auto"))
+
+    if not uses_predformer_openstl_loss(args):
+        return args
+
+    preset = PREDFORMER_TRAIN_PRESETS[get_predformer_recipe(args)]
+    for field, value in preset.items():
         if field not in explicit_cli_args:
             setattr(args, field, value)
     return args
@@ -848,19 +958,22 @@ def resolve_optimizer_config(args):
     args.predrnnpp_recipe = get_predrnnpp_recipe(args)
     args.simvp_model_type = get_simvp_model_type(args)
     args.simvp_recipe = get_simvp_recipe(args)
+    args.predformer_recipe = normalize_predformer_recipe(getattr(args, "predformer_recipe", "auto"))
     opt = str(args.opt).lower()
     if opt == "auto":
-        # Recurrent OpenSTL-style ports such as MIM and PredRNNv2 keep their cell/loss path,
-        # but auto optimizer selection still follows the simvp_spreadf framework defaults rather
-        # than claiming to reproduce the official paper recipe.
-        opt = (
-            "adam"
-            if uses_predrnn_openstl_sequence_loss(args)
-            or uses_simvp_openstl_recipe(args)
-            or is_tau_arch(args)
-            or uses_predformer_facts_openstl_loss(args)
-            else "adamw"
-        )
+        if uses_predformer_openstl_loss(args):
+            opt = "adamw"
+        else:
+            # Recurrent OpenSTL-style ports such as MIM and PredRNNv2 keep their cell/loss path,
+            # but auto optimizer selection still follows the simvp_spreadf framework defaults rather
+            # than claiming to reproduce the official paper recipe.
+            opt = (
+                "adam"
+                if uses_predrnn_openstl_sequence_loss(args)
+                or uses_simvp_openstl_recipe(args)
+                or is_tau_arch(args)
+                else "adamw"
+            )
     args.opt = opt
     return args
 
@@ -869,6 +982,7 @@ def resolve_scheduler_config(args):
     args.predrnnpp_recipe = get_predrnnpp_recipe(args)
     args.simvp_model_type = get_simvp_model_type(args)
     args.simvp_recipe = get_simvp_recipe(args)
+    args.predformer_recipe = normalize_predformer_recipe(getattr(args, "predformer_recipe", "auto"))
     if args.sched == "auto":
         # Likewise, sched=auto stays a framework-level choice. MIM/PredRNNv2 are integrated into
         # the simvp_spreadf training stack here; this is not advertised as an official reproduction run.
@@ -876,8 +990,8 @@ def resolve_scheduler_config(args):
             args.sched = "onecycle"
         elif uses_simvp_openstl_recipe(args):
             args.sched = "onecycle"
-        elif uses_predformer_facts_openstl_loss(args):
-            args.sched = "onecycle"
+        elif uses_predformer_openstl_loss(args):
+            args.sched = "cosine" if get_predformer_recipe(args) in ("human", "weather") else "onecycle"
         elif is_tau_arch(args):
             args.sched = "cosine"
         elif uses_weighted_reconstruction_loss(args):
@@ -888,7 +1002,7 @@ def resolve_scheduler_config(args):
         uses_weighted_reconstruction_loss(args)
         or uses_predrnn_openstl_sequence_loss(args)
         or uses_simvp_openstl_recipe(args)
-        or uses_predformer_facts_openstl_loss(args)
+        or uses_predformer_openstl_loss(args)
         or is_tau_arch(args)
     ):
         args.warmup_epoch = 0
@@ -942,7 +1056,7 @@ def resolve_train_loss_mode(args, loss_weights=None):
         return "mae_openstl"
     if uses_earthfarseer_openstl_loss(args):
         return "mse_openstl"
-    if uses_predformer_facts_openstl_loss(args):
+    if uses_predformer_openstl_loss(args):
         predformer_loss = get_predformer_loss(args)
         if predformer_loss == "hybrid":
             return "0.8000*MAE + 0.2000*MSE"
@@ -1420,6 +1534,7 @@ def main():
     args = parser.parse_args()
     explicit_cli_args = collect_explicit_cli_args(parser)
     args = apply_simvp_recipe_defaults(args, explicit_cli_args=explicit_cli_args)
+    args = apply_predformer_recipe_defaults(args, explicit_cli_args=explicit_cli_args)
     args = resolve_optimizer_config(args)
     args = resolve_scheduler_config(args)
     args.best_metric_mode = resolve_best_metric_mode(args)
@@ -1588,7 +1703,7 @@ def main():
                 f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
                 f"scheduled_sampling: {args.scheduled_sampling}"
             )
-        if args.arch in ("predformer_facts", "predformer_quadruplet_tsst"):
+        if args.arch == "predformer_facts":
             logger.info(
                 f"predformer_patch_size: {args.predformer_patch_size}  "
                 f"predformer_dim: {args.predformer_dim}  "
@@ -1599,6 +1714,23 @@ def main():
                 f"predformer_drop_path: {args.predformer_drop_path}  "
                 f"predformer_scale_dim: {args.predformer_scale_dim}  "
                 f"predformer_depth: {args.predformer_depth}  "
+                f"predformer_recipe: {get_predformer_recipe(args)}  "
+                f"predformer_loss: {args.predformer_loss}"
+            )
+        if args.arch == "predformer_quadruplet_tsst":
+            logger.info(
+                f"predformer_patch_size: {args.predformer_patch_size}  "
+                f"predformer_dim: {args.predformer_dim}  "
+                f"predformer_heads: {args.predformer_heads}  "
+                f"predformer_dim_head: {args.predformer_dim_head}  "
+                f"predformer_dropout: {args.predformer_dropout}  "
+                f"predformer_attn_dropout: {args.predformer_attn_dropout}  "
+                f"predformer_drop_path: {args.predformer_drop_path}  "
+                f"predformer_scale_dim: {args.predformer_scale_dim}  "
+                f"predformer_depth: {args.predformer_depth}  "
+                f"predformer_transformer_depth: {args.predformer_transformer_depth}  "
+                f"predformer_total_gtb_blocks: {4 * int(args.predformer_depth) * int(args.predformer_transformer_depth)}  "
+                f"predformer_recipe: {get_predformer_recipe(args)}  "
                 f"predformer_loss: {args.predformer_loss}"
             )
 
@@ -1742,6 +1874,7 @@ def main():
         predformer_drop_path=args.predformer_drop_path,
         predformer_scale_dim=args.predformer_scale_dim,
         predformer_depth=args.predformer_depth,
+        predformer_transformer_depth=args.predformer_transformer_depth,
         arch=args.arch,
         hybrid_depth=args.hybrid_depth,
         hybrid_heads=args.hybrid_heads,
@@ -1959,7 +2092,7 @@ def main():
                     loss_perceptual = pred.new_zeros(())
                     loss_diff_div = pred.new_zeros(())
                     loss = loss_mse
-                elif uses_predformer_facts_openstl_loss(args):
+                elif uses_predformer_openstl_loss(args):
                     loss_perceptual = pred.new_zeros(())
                     loss_diff_div = pred.new_zeros(())
                     predformer_loss = get_predformer_loss(args)
@@ -2045,7 +2178,7 @@ def main():
                             loss=f"{loss.item():.6f}",
                             mse=f"{loss_mse.item():.6f}",
                         )
-                    elif uses_predformer_facts_openstl_loss(args):
+                    elif uses_predformer_openstl_loss(args):
                         predformer_loss = get_predformer_loss(args)
                         if predformer_loss == "mae":
                             iterator.set_postfix(
@@ -2242,7 +2375,7 @@ def main():
                         f"train_loss: {train_loss:.4f}  train_mse: {train_mse:.4f}  "
                         f"arch: {args.arch}"
                     )
-                elif uses_predformer_facts_openstl_loss(args):
+                elif uses_predformer_openstl_loss(args):
                     predformer_loss = get_predformer_loss(args)
                     if predformer_loss == "mae":
                         logger.info(

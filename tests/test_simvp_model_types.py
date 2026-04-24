@@ -11,6 +11,12 @@ from simvp.wrapper import SimVPForecast
 
 
 class SimVPModelTypeTests(unittest.TestCase):
+    @staticmethod
+    def _make_non_contiguous_video(batch=1, steps=4, channels=1, height=32, width=32):
+        x = torch.randn(batch, steps, channels, height, width * 2)
+        x = x[..., ::2]
+        return x
+
     def _run_forward_and_backward(self, model_type: str):
         model = SimVPForecast(
             in_T=8,
@@ -253,12 +259,27 @@ class SimVPModelTypeTests(unittest.TestCase):
             predformer_heads=4,
             predformer_dim_head=16,
             predformer_depth=2,
+            predformer_transformer_depth=2,
         )
         x = torch.randn(2, 4, 1, 32, 32, requires_grad=True)
         y = model(x)
         self.assertEqual(tuple(y.shape), (2, 2, 1, 32, 32))
         y.square().mean().backward()
         self.assertTrue(any(param.grad is not None for param in model.parameters() if param.requires_grad))
+
+    def test_predformer_quadruplet_tsst_backbone_preserves_sequence_length(self):
+        model = PredFormerQuadrupletTSST_Model(
+            shape_in=(4, 1, 32, 32),
+            patch_size=8,
+            dim=64,
+            heads=4,
+            dim_head=16,
+            depth=2,
+            transformer_depth=2,
+        )
+        x = torch.randn(2, 4, 1, 32, 32)
+        y = model(x)
+        self.assertEqual(tuple(y.shape), (2, 4, 1, 32, 32))
 
     def test_predformer_quadruplet_tsst_supports_odd_predformer_dim(self):
         model = SimVPForecast(
@@ -343,6 +364,60 @@ class SimVPModelTypeTests(unittest.TestCase):
         reloaded.eval()
         y_reloaded = reloaded(x)
         torch.testing.assert_close(y, y_reloaded)
+
+    def test_predformer_models_accept_non_contiguous_inputs(self):
+        models = {
+            "facts": PredFormerFacTS_Model(
+                shape_in=(4, 1, 32, 32),
+                patch_size=8,
+                dim=64,
+                heads=4,
+                dim_head=16,
+                depth=1,
+            ),
+            "quadruplet_tsst": PredFormerQuadrupletTSST_Model(
+                shape_in=(4, 1, 32, 32),
+                patch_size=8,
+                dim=64,
+                heads=4,
+                dim_head=16,
+                depth=2,
+                transformer_depth=2,
+            ),
+        }
+        for name, model in models.items():
+            with self.subTest(model=name):
+                x = self._make_non_contiguous_video(batch=1, steps=4, channels=1, height=32, width=32)
+                self.assertFalse(x.is_contiguous())
+                y = model(x)
+                self.assertEqual(tuple(y.shape), (1, 4, 1, 32, 32))
+
+    def test_predformer_quadruplet_tsst_validates_invalid_configs(self):
+        base_kwargs = dict(
+            shape_in=(4, 1, 32, 32),
+            patch_size=8,
+            dim=64,
+            heads=4,
+            dim_head=16,
+            depth=2,
+            transformer_depth=1,
+        )
+        cases = (
+            ({"patch_size": 0}, "patch_size"),
+            ({"patch_size": 7}, "divisible"),
+            ({"depth": 0}, "depth"),
+            ({"transformer_depth": 0}, "transformer_depth"),
+            ({"heads": 0}, "heads"),
+            ({"dim_head": 0}, "dim_head"),
+            ({"dim": 0}, "dim"),
+            ({"scale_dim": 0}, "scale_dim"),
+            ({"shape_in": (4, 1, 32)}, "shape_in"),
+            ({"shape_in": (4, 0, 32, 32)}, "C"),
+        )
+        for overrides, error_snippet in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, error_snippet):
+                    PredFormerQuadrupletTSST_Model(**{**base_kwargs, **overrides})
 
 
 if __name__ == "__main__":
