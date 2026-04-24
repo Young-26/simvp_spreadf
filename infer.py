@@ -36,7 +36,7 @@ def build_parser():
     parser.add_argument("--simvp_recipe", type=str, default=None, choices=SIMVP_RECIPE_CHOICES)
     parser.add_argument("--predrnnpp_recipe", type=str, default=None, choices=PREDRNNPP_RECIPE_CHOICES)
     parser.add_argument("--predformer_patch_size", type=int, default=None)
-    parser.add_argument("--predformer_dim", type=int, default=None, help="PredFormer_FacTS embedding dim. Odd values are supported.")
+    parser.add_argument("--predformer_dim", type=int, default=None, help="PredFormer embedding dim. Odd values are supported.")
     parser.add_argument("--predformer_heads", type=int, default=None)
     parser.add_argument("--predformer_dim_head", type=int, default=None)
     parser.add_argument("--predformer_dropout", type=float, default=None)
@@ -47,7 +47,7 @@ def build_parser():
         "--predformer_depth",
         type=int,
         default=None,
-        help="Shared transformer stack depth for the FacTS port; the same depth is used for both temporal and spatial branches.",
+        help="For predformer_facts this is the shared temporal/spatial stack depth. For predformer_quadruplet_tsst it is the number of stacked TSST blocks.",
     )
     parser.add_argument("--use_local_branch", action="store_true", default=None)
     parser.add_argument("--local_top", type=int, default=None)

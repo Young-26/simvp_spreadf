@@ -5,6 +5,7 @@ from .mau_model import MAU_Model
 from .mim_model import MIM_Model
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
+from .predformer_quadruplet_tsst_model import PredFormerQuadrupletTSST_Model
 from .predrnnpp_model import PredRNNpp_Model
 from .predrnnv2_model import PredRNNv2_Model
 from .tau_model import TAU_Model
@@ -19,6 +20,7 @@ __all__ = [
     "MAU_Model",
     "MIM_Model",
     "PredFormerFacTS_Model",
+    "PredFormerQuadrupletTSST_Model",
     "PredRNNpp_Model",
     "PredRNNv2_Model",
     "SUPPORTED_ARCHS",

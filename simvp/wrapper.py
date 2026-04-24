@@ -9,6 +9,7 @@ from .mau_model import MAU_Model
 from .mim_model import MIM_Model
 from .model import SimVP
 from .predformer_facts_model import PredFormerFacTS_Model
+from .predformer_quadruplet_tsst_model import PredFormerQuadrupletTSST_Model
 from .predrnnpp_model import PredRNNpp_Model
 from .predrnnv2_model import PredRNNv2_Model
 from .simvp_config import (
@@ -32,6 +33,7 @@ SUPPORTED_ARCHS = (
     "predrnnpp",
     "predrnnv2",
     "predformer_facts",
+    "predformer_quadruplet_tsst",
 )
 
 
@@ -341,6 +343,22 @@ class SimVPForecast(nn.Module):
                 scale_dim=predformer_scale_dim,
                 depth=predformer_depth,
             )
+        elif self.arch == "predformer_quadruplet_tsst":
+            # Keep the public predformer_depth knob for compatibility. In the local TSST port
+            # it maps to the number of stacked TSST blocks, while each internal transformer
+            # keeps the upstream single-block depth.
+            self.backbone = PredFormerQuadrupletTSST_Model(
+                shape_in=(in_T, C, H, W),
+                patch_size=predformer_patch_size,
+                dim=predformer_dim,
+                heads=predformer_heads,
+                dim_head=predformer_dim_head,
+                dropout=predformer_dropout,
+                attn_dropout=predformer_attn_dropout,
+                drop_path=predformer_drop_path,
+                scale_dim=predformer_scale_dim,
+                depth=predformer_depth,
+            )
         elif self.arch == "hybrid_unet_facts":
             self.backbone = HybridUNetFacTS(
                 in_T=in_T,
@@ -417,7 +435,7 @@ class SimVPForecast(nn.Module):
             return y
         if self.arch == "earthfarseer":
             return y
-        if self.arch == "predformer_facts":
+        if self.arch in ("predformer_facts", "predformer_quadruplet_tsst"):
             if self.out_T <= x.shape[1]:
                 return y[:, :self.out_T]
 

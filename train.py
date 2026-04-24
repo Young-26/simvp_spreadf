@@ -128,9 +128,12 @@ def uses_earthfarseer_openstl_loss(args) -> bool:
 
 
 def uses_predformer_facts_openstl_loss(args) -> bool:
-    # PredFormer_FacTS follows an OpenSTL-style direct prediction objective. The
-    # concrete loss type is selected via --predformer_loss.
-    return str(getattr(args, "arch", "simvp")).lower() == "predformer_facts"
+    # The local PredFormer ports follow an OpenSTL-style direct prediction objective.
+    # The concrete loss type is selected via --predformer_loss.
+    return str(getattr(args, "arch", "simvp")).lower() in (
+        "predformer_facts",
+        "predformer_quadruplet_tsst",
+    )
 
 
 def get_predformer_loss(args) -> str:
@@ -334,7 +337,7 @@ def build_parser():
     parser.add_argument("--r_sampling_step_2", type=int, default=50000)
     parser.add_argument("--r_exp_alpha", type=float, default=5000.0)
     parser.add_argument("--predformer_patch_size", type=int, default=16)
-    parser.add_argument("--predformer_dim", type=int, default=256, help="PredFormer_FacTS embedding dim. Odd values are supported.")
+    parser.add_argument("--predformer_dim", type=int, default=256, help="PredFormer embedding dim. Odd values are supported.")
     parser.add_argument("--predformer_heads", type=int, default=8)
     parser.add_argument("--predformer_dim_head", type=int, default=32)
     parser.add_argument("--predformer_dropout", type=float, default=0.0)
@@ -345,14 +348,14 @@ def build_parser():
         "--predformer_depth",
         type=int,
         default=4,
-        help="Shared transformer stack depth for the FacTS port; the same depth is used for both temporal and spatial branches.",
+        help="For predformer_facts this is the shared temporal/spatial stack depth. For predformer_quadruplet_tsst it is the number of stacked TSST blocks.",
     )
     parser.add_argument(
         "--predformer_loss",
         type=str,
         default="mae",
         choices=("mae", "mse", "hybrid"),
-        help="Training loss for arch='predformer_facts'. Use 'hybrid' for 0.8*L1 + 0.2*MSE.",
+        help="Training loss for PredFormer arches. Use 'hybrid' for 0.8*L1 + 0.2*MSE.",
     )
     parser.add_argument("--in_T", type=int, default=8)
     parser.add_argument("--out_T", type=int, default=2)
@@ -1585,7 +1588,7 @@ def main():
                 f"reverse_scheduled_sampling: {args.reverse_scheduled_sampling}  "
                 f"scheduled_sampling: {args.scheduled_sampling}"
             )
-        if args.arch == "predformer_facts":
+        if args.arch in ("predformer_facts", "predformer_quadruplet_tsst"):
             logger.info(
                 f"predformer_patch_size: {args.predformer_patch_size}  "
                 f"predformer_dim: {args.predformer_dim}  "

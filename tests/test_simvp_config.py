@@ -230,6 +230,17 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
         self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
 
+    def test_predformer_quadruplet_tsst_uses_mae_openstl_loss_mode(self):
+        args = self._make_train_args(
+            arch="predformer_quadruplet_tsst",
+            simvp_model_type="gsta",
+            simvp_recipe="openstl",
+        )
+
+        self.assertTrue(train_lib.uses_predformer_facts_openstl_loss(args))
+        self.assertFalse(train_lib.uses_local_reconstruction_loss(args))
+        self.assertEqual(train_lib.resolve_train_loss_mode(args), "mae_openstl")
+
     def test_predformer_facts_supports_mse_openstl_loss_mode(self):
         args = self._make_train_args(
             arch="predformer_facts",
@@ -390,6 +401,26 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(model_kwargs["predformer_heads"], 4)
         self.assertEqual(model_kwargs["predformer_dim_head"], 16)
         self.assertEqual(model_kwargs["predformer_depth"], 2)
+
+    def test_build_forecast_model_kwargs_supports_predformer_quadruplet_tsst(self):
+        model_kwargs, metadata = build_forecast_model_kwargs_from_config(
+            {
+                "arch": "predformer_quadruplet_tsst",
+                "in_T": 4,
+                "out_T": 2,
+                "predformer_patch_size": 8,
+                "predformer_dim": 64,
+                "predformer_heads": 4,
+                "predformer_dim_head": 16,
+                "predformer_depth": 2,
+            },
+            image_mode="L",
+            image_size=32,
+        )
+        self.assertEqual(metadata["arch"], "predformer_quadruplet_tsst")
+        model = SimVPForecast(**model_kwargs)
+        x = torch.randn(1, 4, 1, 32, 32)
+        self.assertEqual(tuple(model(x).shape), (1, 2, 1, 32, 32))
 
     def test_build_forecast_model_kwargs_includes_predrnnv2_fields(self):
         model_kwargs, metadata = build_forecast_model_kwargs_from_config(

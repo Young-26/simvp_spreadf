@@ -251,8 +251,9 @@ def build_forecast_model_kwargs_from_config(
         "predformer_scale_dim": int(
             _coalesce(overrides.get("predformer_scale_dim"), config.get("predformer_scale_dim"), 4)
         ),
-        # predformer_depth keeps the public config name; in this FacTS port it is the
-        # shared stack depth used by both the temporal and spatial transformer branches.
+        # predformer_depth keeps the public config name for both local PredFormer ports.
+        # FacTS interprets it as the shared temporal/spatial stack depth, while the
+        # Quadruplet_TSST port uses it as the number of stacked TSST blocks.
         "predformer_depth": int(_coalesce(overrides.get("predformer_depth"), config.get("predformer_depth"), 4)),
         "arch": arch,
         "hybrid_depth": int(config.get("hybrid_depth", 2)),
