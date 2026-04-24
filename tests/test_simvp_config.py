@@ -68,6 +68,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(normalize_simvp_model_type("gsta"), "gsta")
         self.assertEqual(normalize_simvp_model_type("moga"), "moganet")
         self.assertEqual(normalize_simvp_model_type("moganet"), "moganet")
+        self.assertEqual(normalize_simvp_model_type("uniformer"), "uniformer")
         self.assertEqual(normalize_simvp_model_type("v1"), "incepu")
         self.assertEqual(normalize_simvp_model_type("simvpv1"), "incepu")
         self.assertEqual(normalize_simvp_model_type("v2"), "gsta")
@@ -180,6 +181,25 @@ class SimVPConfigTests(unittest.TestCase):
         args = train_lib.resolve_scheduler_config(args)
 
         self.assertEqual(args.simvp_model_type, "moganet")
+        self.assertEqual(get_effective_simvp_recipe(args.arch, args.simvp_model_type, args.simvp_recipe), "openstl")
+        self.assertTrue(is_simvp_openstl_recipe(args.arch, args.simvp_model_type, args.simvp_recipe))
+        self.assertEqual(args.opt, "adam")
+        self.assertEqual(args.sched, "onecycle")
+        self.assertEqual(args.hid_S, SIMVP_OPENSTL_TRAIN_PRESET["hid_S"])
+        self.assertEqual(args.hid_T, SIMVP_OPENSTL_TRAIN_PRESET["hid_T"])
+        self.assertEqual(args.N_S, SIMVP_OPENSTL_TRAIN_PRESET["N_S"])
+        self.assertEqual(args.N_T, SIMVP_OPENSTL_TRAIN_PRESET["N_T"])
+        self.assertEqual(args.lr, SIMVP_OPENSTL_TRAIN_PRESET["lr"])
+        self.assertEqual(args.batch_size, SIMVP_OPENSTL_TRAIN_PRESET["batch_size"])
+        self.assertEqual(args.warmup_epoch, 0)
+
+    def test_simvp_uniformer_openstl_recipe_resolves_auto_optimizer_scheduler(self):
+        args = self._make_train_args(simvp_model_type="uniformer", simvp_recipe="auto")
+        args = train_lib.apply_simvp_recipe_defaults(args, explicit_cli_args=set())
+        args = train_lib.resolve_optimizer_config(args)
+        args = train_lib.resolve_scheduler_config(args)
+
+        self.assertEqual(args.simvp_model_type, "uniformer")
         self.assertEqual(get_effective_simvp_recipe(args.arch, args.simvp_model_type, args.simvp_recipe), "openstl")
         self.assertTrue(is_simvp_openstl_recipe(args.arch, args.simvp_model_type, args.simvp_recipe))
         self.assertEqual(args.opt, "adam")
@@ -424,7 +444,7 @@ class SimVPConfigTests(unittest.TestCase):
         self.assertEqual(tuple(predict_model(x).shape), (1, 2, 1, 64, 64))
 
     def test_canonical_choices_remain_small_and_stable(self):
-        self.assertEqual(SIMVP_MODEL_TYPE_CHOICES, ("incepu", "gsta", "moganet"))
+        self.assertEqual(SIMVP_MODEL_TYPE_CHOICES, ("incepu", "gsta", "moganet", "uniformer"))
         self.assertIn("predformer_quadruplet_tsst", SUPPORTED_ARCHS)
 
     def test_build_forecast_model_kwargs_includes_predformer_facts_fields(self):

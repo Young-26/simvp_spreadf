@@ -8,6 +8,7 @@ from .modules import ConvSC, Inception
 from .simvp_config import normalize_simvp_model_type
 from .tau_model import Decoder as MetaDecoder
 from .tau_model import DropPath, Encoder as MetaEncoder, MixMlp
+from .uniformer_layers import UniformerSubBlock
 
 
 def stride_generator(N, reverse=False):
@@ -268,6 +269,7 @@ class MetaBlock(nn.Module):
         mlp_ratio=8.0,
         drop=0.0,
         drop_path=0.0,
+        layer_i=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -290,10 +292,19 @@ class MetaBlock(nn.Module):
                 drop_rate=drop,
                 drop_path_rate=drop_path,
             )
+        elif model_type == "uniformer":
+            block_type = "MHSA" if in_channels == out_channels and layer_i > 0 else "Conv"
+            self.block = UniformerSubBlock(
+                in_channels,
+                mlp_ratio=mlp_ratio,
+                drop=drop,
+                drop_path=drop_path,
+                block_type=block_type,
+            )
         else:
             raise ValueError(
                 f"Unsupported SimVP MetaBlock model_type '{model_type}'. "
-                "Implemented metaformer choices: ('gsta', 'moganet')."
+                "Implemented metaformer choices: ('gsta', 'moganet', 'uniformer')."
             )
         self.reduction = None
         if in_channels != out_channels:
@@ -331,6 +342,7 @@ class MidMetaNet(nn.Module):
                 mlp_ratio=mlp_ratio,
                 drop=drop,
                 drop_path=dpr[0],
+                layer_i=0,
             )
         ]
         for i in range(1, N_T - 1):
@@ -342,6 +354,7 @@ class MidMetaNet(nn.Module):
                     mlp_ratio=mlp_ratio,
                     drop=drop,
                     drop_path=dpr[i],
+                    layer_i=i,
                 )
             )
         enc_layers.append(
@@ -352,6 +365,7 @@ class MidMetaNet(nn.Module):
                 mlp_ratio=mlp_ratio,
                 drop=drop,
                 drop_path=drop_path,
+                layer_i=N_T - 1,
             )
         )
         self.enc = nn.Sequential(*enc_layers)
@@ -390,7 +404,7 @@ class SimVP(nn.Module):
             self.enc = Encoder(C, hid_S, N_S)
             self.hid = Mid_Xnet(T * hid_S, hid_T, N_T, incep_ker, groups)
             self.dec = Decoder(hid_S, C, N_S)
-        elif model_type in ("gsta", "moganet"):
+        elif model_type in ("gsta", "moganet", "uniformer"):
             act_inplace = False
             self.enc = MetaEncoder(
                 C,
@@ -417,7 +431,7 @@ class SimVP(nn.Module):
             )
         else:
             raise ValueError(
-                f"Unsupported SimVP model_type '{model_type}'. Available choices: ('incepu', 'gsta', 'moganet')."
+                f"Unsupported SimVP model_type '{model_type}'. Available choices: ('incepu', 'gsta', 'moganet', 'uniformer')."
             )
 
     def forward(self, x_raw):

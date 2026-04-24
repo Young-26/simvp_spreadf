@@ -3,11 +3,21 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 
-SIMVP_MODEL_TYPE_CHOICES = ("incepu", "gsta", "moganet")
-SIMVP_MODEL_TYPE_ALIASES = ("incepu", "gsta", "moga", "moganet", "v1", "v2", "simvpv1", "simvpv2")
+SIMVP_MODEL_TYPE_CHOICES = ("incepu", "gsta", "moganet", "uniformer")
+SIMVP_MODEL_TYPE_ALIASES = (
+    "incepu",
+    "gsta",
+    "moga",
+    "moganet",
+    "uniformer",
+    "v1",
+    "v2",
+    "simvpv1",
+    "simvpv2",
+)
 SIMVP_RECIPE_CHOICES = ("auto", "simvp", "openstl")
 PREDRNNPP_RECIPE_CHOICES = ("simvp", "openstl")
-SIMVP_OPENSTL_MODEL_TYPES = frozenset(("gsta", "moganet"))
+SIMVP_OPENSTL_MODEL_TYPES = frozenset(("gsta", "moganet", "uniformer"))
 
 SIMVP_OPENSTL_TRAIN_PRESET = {
     "hid_S": 64,
@@ -26,6 +36,7 @@ _SIMVP_MODEL_TYPE_ALIAS_MAP = {
     "gsta": "gsta",
     "moga": "moganet",
     "moganet": "moganet",
+    "uniformer": "uniformer",
     "v1": "incepu",
     "simvpv1": "incepu",
     "v2": "gsta",
