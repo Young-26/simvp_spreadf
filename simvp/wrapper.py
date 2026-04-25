@@ -8,8 +8,6 @@ from .hybrid_unet_facts import HybridUNetFacTS
 from .mau_model import MAU_Model
 from .mim_model import MIM_Model
 from .model import SimVP
-from .predformer_facts_model import PredFormerFacTS_Model
-from .predformer_quadruplet_tsst_model import PredFormerQuadrupletTSST_Model
 from .predrnnpp_model import PredRNNpp_Model
 from .predrnnv2_model import PredRNNv2_Model
 from .simvp_config import (
@@ -20,6 +18,15 @@ from .simvp_config import (
     normalize_simvp_recipe,
 )
 from .tau_model import TAU_Model
+
+try:
+    from .predformer_facts_model import PredFormerFacTS_Model
+    from .predformer_quadruplet_tsst_model import PredFormerQuadrupletTSST_Model
+    _PREDFORMER_IMPORT_ERROR = None
+except ImportError as exc:
+    PredFormerFacTS_Model = None
+    PredFormerQuadrupletTSST_Model = None
+    _PREDFORMER_IMPORT_ERROR = exc
 
 
 SUPPORTED_ARCHS = (
@@ -332,6 +339,12 @@ class SimVPForecast(nn.Module):
         elif self.arch == "predformer_facts":
             # predformer_depth remains the external config name for compatibility. In this
             # FacTS port it controls the shared stack depth used by both transformer branches.
+            if PredFormerFacTS_Model is None:
+                raise ImportError(
+                    "predformer_facts is unavailable because the local PredFormer modules failed to import. "
+                    "Sync simvp/predformer_facts_model.py and simvp/predformer_quadruplet_tsst_model.py "
+                    "from the same revision."
+                ) from _PREDFORMER_IMPORT_ERROR
             self.backbone = PredFormerFacTS_Model(
                 shape_in=(in_T, C, H, W),
                 patch_size=predformer_patch_size,
@@ -349,6 +362,12 @@ class SimVPForecast(nn.Module):
             # it maps to the number of stacked Quadruplet-TSST layers (official PredFormer's
             # Ndepth), while predformer_transformer_depth controls the depth inside each
             # GatedTransformer branch. Total GTB blocks = 4 * predformer_depth * predformer_transformer_depth.
+            if PredFormerQuadrupletTSST_Model is None:
+                raise ImportError(
+                    "predformer_quadruplet_tsst is unavailable because the local PredFormer modules failed to import. "
+                    "Sync simvp/predformer_facts_model.py and simvp/predformer_quadruplet_tsst_model.py "
+                    "from the same revision."
+                ) from _PREDFORMER_IMPORT_ERROR
             self.backbone = PredFormerQuadrupletTSST_Model(
                 shape_in=(in_T, C, H, W),
                 patch_size=predformer_patch_size,

@@ -12,8 +12,8 @@ Features
 4) Re-run only selected samples and optionally save:
    - mosaic images (8 inputs + 2 GT + 2 Pred)
    - standalone pred_01.png / pred_02.png
-5) Optionally export pred_01.png / pred_02.png for ALL validation samples,
-   with one subdirectory per sample.
+5) Optionally export pred_01.png / pred_02.png for ALL validation samples
+   directly into cls_eval/pred1|pred2/<class>/ for ImageFolder-style evaluation.
 
 Designed to match repo structure at commit:
 971dfdf05dee5a4120a5e0ea73b4f89e8ed302ef
@@ -69,10 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selected_rows_path", type=str, default=None, help="Optional explicit path for selected_rows__*.json")
     parser.add_argument("--mosaic_dir", type=str, default=None, help="Optional explicit mosaic output directory")
     parser.add_argument("--pred_frames_dir", type=str, default=None, help="Optional explicit pred frame output directory for selected rows")
-    parser.add_argument("--all_pred_frames_dir", type=str, default=None, help="Optional explicit pred frame output directory for ALL rows")
+    parser.add_argument("--all_pred_frames_dir", type=str, default=None, help="Deprecated; ALL rows are now exported directly to cls_eval")
     parser.add_argument("--all_pred_manifest_path", type=str, default=None, help="Optional explicit path for pred_frames_manifest.jsonl when exporting ALL rows")
-    parser.add_argument("--cls_eval_dir", type=str, default=None, help="Optional explicit cls_eval directory used for ImageFolder-style symlink export")
-    parser.add_argument("--build_cls_eval_symlinks", action="store_true", help="Build cls_eval/pred1|pred2/<class>/ symlink trees after exporting ALL rows")
+    parser.add_argument("--cls_eval_dir", type=str, default=None, help="Optional explicit cls_eval directory used for ImageFolder-style export")
+    parser.add_argument("--build_cls_eval_symlinks", action="store_true", help="Deprecated; kept for compatibility. ALL rows are now written directly to cls_eval")
 
     parser.add_argument("--batch_size", type=int, default=None, help="Inference batch size. Defaults to ckpt val_batch_size/batch_size/4")
     parser.add_argument("--num_workers", type=int, default=None, help="Dataloader workers. Defaults to ckpt num_workers/4")
@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--save_selected", action="store_true", help="Save mosaics for selected groups")
     parser.add_argument("--save_pred_frames", action="store_true", help="Save standalone pred_01.png / pred_02.png for selected groups")
-    parser.add_argument("--save_all_pred_frames", action="store_true", help="Save standalone pred_01.png / pred_02.png for ALL validation samples")
+    parser.add_argument("--save_all_pred_frames", action="store_true", help="Save pred_01.png / pred_02.png for ALL validation samples directly into cls_eval")
     parser.add_argument("--selected_json", type=str, default=None, help="Optional custom selected json, supports dataset_indices/sample_ids")
     parser.add_argument("--selected_name", type=str, default=None, help="Name suffix for selected output group")
 
@@ -461,6 +461,56 @@ def save_pred_frames(sample_dir: Path, pred: torch.Tensor) -> None:
         pil.save(sample_dir / f"pred_{i+1:02d}.png")
 
 
+def save_cls_eval_pred_frames(
+    cls_eval_dir: Path,
+    pred: torch.Tensor,
+    raw_item: Dict[str, Any],
+    dataset_idx: int,
+    sample_id: str,
+) -> Dict[str, Any]:
+    pred_T = int(pred.shape[0])
+    if pred_T < 2:
+        raise ValueError(f"Sample idx={dataset_idx} produced {pred_T} prediction frame(s), expected at least 2.")
+
+    target_paths = [str(p) for p in raw_item.get("target_paths", [])]
+    if len(target_paths) < pred_T:
+        raise ValueError(
+            f"Sample idx={dataset_idx} target_paths length is {len(target_paths)}, expected at least {pred_T}."
+        )
+
+    safe_sid = sanitize_name(sample_id)
+    pred_paths: List[str] = []
+    gt_labels: List[str] = []
+
+    for i in range(pred_T):
+        split_name = f"pred{i + 1}"
+        class_name = infer_gt_label_from_path(target_paths[i])
+        dst = cls_eval_dir / split_name / class_name / f"idx_{dataset_idx:06d}__{safe_sid}__{split_name}.png"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        pil = uint8_to_pil(chw_to_uint8(pred[i]))
+        pil.save(dst)
+        pred_paths.append(str(dst.resolve()))
+        gt_labels.append(class_name)
+
+    return {
+        "dataset_idx": int(dataset_idx),
+        "sample_id": str(sample_id),
+        "sequence_id": raw_item.get("sequence_id"),
+        "year": raw_item.get("year"),
+        "label": raw_item.get("label"),
+        "source": raw_item.get("source"),
+        "split": raw_item.get("split"),
+        "timestamps": raw_item.get("timestamps"),
+        "input_paths": [str(p) for p in raw_item.get("input_paths", [])],
+        "target_paths": target_paths,
+        "gt_label_pred1": gt_labels[0],
+        "gt_label_pred2": gt_labels[1],
+        "pred1_path": pred_paths[0],
+        "pred2_path": pred_paths[1],
+        "sample_dir": str(cls_eval_dir.resolve()),
+    }
+
+
 # -----------------------------
 # Selection helpers
 # -----------------------------
@@ -791,6 +841,53 @@ def export_all_pred_frames(
     return manifest_rows
 
 
+@torch.no_grad()
+def export_all_cls_eval_frames(
+    model: nn.Module,
+    dataset: IonogramManifestDataset,
+    device: torch.device,
+    amp_enabled: bool,
+    strict_local: bool,
+    cls_eval_dir: Path,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    model.eval()
+    if cls_eval_dir.exists():
+        shutil.rmtree(cls_eval_dir)
+    for split_name in ["pred1", "pred2"]:
+        for class_name in CANONICAL_CLASS_NAMES:
+            (cls_eval_dir / split_name / class_name).mkdir(parents=True, exist_ok=True)
+
+    counts = {"pred1": 0, "pred2": 0}
+    manifest_rows: List[Dict[str, Any]] = []
+
+    pbar = tqdm(range(len(dataset)), desc="Export all cls_eval frames", dynamic_ncols=True)
+    for idx in pbar:
+        raw_item = dataset.samples[idx]
+        item = dataset[idx]
+        sample_id = str(item.get("sample_id", item.get("sequence_id", idx)))
+        x = item["x"].unsqueeze(0).to(device)
+        x_local = item.get("x_local")
+        if x_local is not None:
+            x_local = x_local.unsqueeze(0).to(device)
+
+        with torch.amp.autocast(device_type="cuda", enabled=(amp_enabled and device.type == "cuda")):
+            pred = model(x, x_local=x_local, strict_local=strict_local).squeeze(0).detach().cpu()
+
+        meta = save_cls_eval_pred_frames(
+            cls_eval_dir=cls_eval_dir,
+            pred=pred,
+            raw_item=raw_item,
+            dataset_idx=idx,
+            sample_id=sample_id,
+        )
+        for i in range(int(pred.shape[0])):
+            split_name = f"pred{i + 1}"
+            counts[split_name] = counts.get(split_name, 0) + 1
+        manifest_rows.append(meta)
+
+    return manifest_rows, counts
+
+
 def main() -> None:
     args = parse_args()
     if args.no_pin_memory:
@@ -961,26 +1058,31 @@ def main() -> None:
         print(f"[Info] selected export finished in {time.time() - export_t0:.1f}s")
 
     if args.save_all_pred_frames:
-        all_pred_frames_dir = ensure_dir(args.all_pred_frames_dir) if args.all_pred_frames_dir else ensure_dir(output_dir / "pred_frames__all")
-        print(f"[Info] all pred frames dir: {all_pred_frames_dir}")
+        if args.all_pred_frames_dir:
+            print("[Warn] --all_pred_frames_dir is ignored; all validation predictions are written directly to cls_eval.")
+        else:
+            legacy_all_pred_frames_dir = output_dir / "pred_frames__all"
+            if legacy_all_pred_frames_dir.exists():
+                print(f"[Info] existing legacy pred_frames__all left untouched: {legacy_all_pred_frames_dir}")
+        if args.build_cls_eval_symlinks:
+            print("[Info] --build_cls_eval_symlinks is no longer needed; writing cls_eval images directly.")
+        print(f"[Info] cls_eval dir: {cls_eval_dir}")
         export_all_t0 = time.time()
-        manifest_rows = export_all_pred_frames(
+        manifest_rows, cls_counts = export_all_cls_eval_frames(
             model=model,
             dataset=dataset,
             device=device,
             amp_enabled=args.amp,
             strict_local=use_local_branch,
-            save_dir=all_pred_frames_dir,
+            cls_eval_dir=cls_eval_dir,
         )
         jsonl_dump(manifest_rows, all_pred_manifest_path)
         print(f"[Info] pred manifest saved: {all_pred_manifest_path}")
-        if args.build_cls_eval_symlinks:
-            cls_counts = build_cls_eval_symlinks(manifest_rows, cls_eval_dir=ensure_dir(cls_eval_dir))
-            print(
-                f"[Info] cls_eval symlinks built: {cls_eval_dir} "
-                f"(pred1={cls_counts['pred1']}, pred2={cls_counts['pred2']})"
-            )
-        print(f"[Info] all pred frames export finished in {time.time() - export_all_t0:.1f}s")
+        print(
+            f"[Info] cls_eval images saved: {cls_eval_dir} "
+            f"(pred1={cls_counts['pred1']}, pred2={cls_counts['pred2']})"
+        )
+        print(f"[Info] all cls_eval export finished in {time.time() - export_all_t0:.1f}s")
 
     print(f"[Info] done, total elapsed={time.time() - t0:.1f}s")
 

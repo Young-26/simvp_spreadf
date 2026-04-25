@@ -1,11 +1,37 @@
 import json
+import os
+import signal
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import Dataset
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+@contextmanager
+def _image_load_timeout(timeout_sec: float):
+    if timeout_sec is None or float(timeout_sec) <= 0 or os.name == "nt" or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    timeout_sec = float(timeout_sec)
+
+    def _handle_timeout(signum, frame):
+        raise TimeoutError(f"Image load exceeded timeout of {timeout_sec:.1f}s.")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_sec)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 class IonogramManifestDataset(Dataset):
@@ -16,12 +42,18 @@ class IonogramManifestDataset(Dataset):
         image_size: int = 448,
         normalize_to_01: bool = True,
         local_crop: Optional[Tuple[int, int]] = (186, 410),
+        image_load_timeout_sec: float = 0.0,
+        skip_bad_samples: bool = False,
+        max_decode_retries: int = 3,
     ):
         self.manifest_path = Path(manifest_path)
         self.image_mode = image_mode
         self.image_size = image_size
         self.normalize_to_01 = normalize_to_01
         self.local_crop = local_crop
+        self.image_load_timeout_sec = float(image_load_timeout_sec)
+        self.skip_bad_samples = bool(skip_bad_samples)
+        self.max_decode_retries = max(1, int(max_decode_retries))
 
         self.samples: List[Dict] = []
         with open(self.manifest_path, "r", encoding="utf-8") as f:
@@ -58,12 +90,14 @@ class IonogramManifestDataset(Dataset):
         return len(self.samples)
 
     def _load_image(self, path: str) -> torch.Tensor:
-        img = Image.open(path).convert(self.image_mode)
+        with _image_load_timeout(self.image_load_timeout_sec):
+            with Image.open(path) as img:
+                img = img.convert(self.image_mode)
 
-        if self.image_size is not None:
-            img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
+                if self.image_size is not None:
+                    img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
 
-        arr = np.asarray(img, dtype=np.float32)
+                arr = np.asarray(img, dtype=np.float32)
 
         if self.image_mode == "L":
             arr = arr[..., None]  # H,W -> H,W,1
@@ -74,7 +108,7 @@ class IonogramManifestDataset(Dataset):
         arr = np.transpose(arr, (2, 0, 1))  # HWC -> CHW
         return torch.from_numpy(arr).float()
 
-    def __getitem__(self, idx):
+    def _build_sample(self, idx: int):
         item = self.samples[idx]
 
         x = torch.stack([self._load_image(p) for p in item["input_paths"]], dim=0)   # [8, C, H, W]
@@ -98,6 +132,28 @@ class IonogramManifestDataset(Dataset):
             sample["y_local"] = self.crop_f_region(y)
 
         return sample
+
+    def __getitem__(self, idx):
+        last_error = None
+        sample_idx = int(idx)
+        for retry_idx in range(self.max_decode_retries):
+            try:
+                return self._build_sample(sample_idx)
+            except Exception as exc:
+                last_error = exc
+                if not self.skip_bad_samples:
+                    raise
+                item = self.samples[sample_idx]
+                sample_id = item.get("sample_id", item.get("sequence_id", str(sample_idx)))
+                print(
+                    f"[dataset] skipping bad sample idx={sample_idx} sample_id={sample_id} "
+                    f"retry={retry_idx + 1}/{self.max_decode_retries} error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                sample_idx = (sample_idx + 1) % len(self.samples)
+        raise RuntimeError(
+            f"Failed to decode sample starting from idx={idx} after {self.max_decode_retries} retries."
+        ) from last_error
     
     def crop_f_region(self, seq: torch.Tensor) -> torch.Tensor:
         # Fixed F-region crop boundary in the 448x448 image coordinate system.

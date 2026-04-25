@@ -221,6 +221,26 @@ def get_predformer_loss(args) -> str:
     return loss_name
 
 
+def get_local_reconstruction_loss(args) -> str:
+    loss_name = str(getattr(args, "recon_loss", "auto")).strip().lower()
+    if loss_name == "auto":
+        arch = str(getattr(args, "arch", "")).strip().lower()
+        use_local_branch = bool(getattr(args, "use_local_branch", False))
+        if arch == "hybrid_unet_facts" and not use_local_branch:
+            return "hybrid"
+        return "mae"
+    if loss_name not in ("mae", "mse", "smooth_l1", "hybrid"):
+        raise ValueError(
+            "Unsupported recon_loss "
+            f"'{loss_name}'. Available choices: ('auto', 'mae', 'mse', 'smooth_l1', 'hybrid')."
+        )
+    return loss_name
+
+
+def uses_local_branch_training(args) -> bool:
+    return bool(getattr(args, "use_local_branch", False))
+
+
 def uses_weighted_reconstruction_loss(args) -> bool:
     arch = str(args.arch).lower()
     return arch == "convlstm" or (is_predrnnpp_arch(args) and get_predrnnpp_recipe(args) == "simvp")
@@ -258,6 +278,13 @@ def should_enable_ddp_find_unused_parameters(args) -> bool:
     # but intentionally not consumed in the current forward path. DDP therefore needs unused-parameter
     # detection for both ports to avoid reduction hangs on multi-GPU runs.
     return is_predrnnpp_arch(args) or is_mim_arch(args)
+
+
+def should_enable_ddp_static_graph(args) -> bool:
+    # hybrid_unet_facts runs with fixed tensor shapes and one stable parameter-usage pattern
+    # across iterations when use_local_branch is fixed for the whole run. Treat it as a
+    # static graph so DDP can skip per-iteration bucket rebuilding and unused-parameter scans.
+    return str(getattr(args, "arch", "")).lower() == "hybrid_unet_facts"
 
 
 def resolve_recipe_tag(args) -> str:
@@ -500,6 +527,21 @@ def build_parser():
     parser.add_argument("--use_local_branch", action="store_true")
     parser.add_argument("--lambda_global", type=float, default=1.0)
     parser.add_argument("--lambda_local", type=float, default=0.5)
+    parser.add_argument(
+        "--recon_loss",
+        type=str,
+        default="auto",
+        choices=("auto", "mae", "mse", "smooth_l1", "hybrid"),
+        help=(
+            "Reconstruction loss for the default direct-prediction path used by hybrid_unet_facts "
+            "and similar non-OpenSTL branches. 'auto' maps hybrid_unet_facts without "
+            "local_branch to 0.8*MAE + 0.2*MSE and falls back to MAE otherwise. "
+            "'hybrid' means recon_mae_weight*MAE + recon_mse_weight*MSE."
+        ),
+    )
+    parser.add_argument("--smooth_l1_beta", type=float, default=1.0)
+    parser.add_argument("--recon_mae_weight", type=float, default=0.8)
+    parser.add_argument("--recon_mse_weight", type=float, default=0.2)
     parser.add_argument("--loss_mae_weight", type=float, default=None)
     parser.add_argument("--loss_mse_weight", type=float, default=None)
     parser.add_argument("--loss_percep_weight", type=float, default=None)
@@ -515,6 +557,14 @@ def build_parser():
     parser.add_argument("--local_top", type=int, default=186)
     parser.add_argument("--local_bottom", type=int, default=410)
     parser.add_argument("--report_local_metrics", action="store_true")
+    parser.add_argument("--image_load_timeout_sec", type=float, default=20.0)
+    parser.add_argument(
+        "--skip_bad_samples",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip samples whose images fail or time out during decode instead of hanging or crashing training.",
+    )
+    parser.add_argument("--max_decode_retries", type=int, default=3)
     parser.add_argument(
         "--best_metric_mode",
         type=str,
@@ -525,8 +575,23 @@ def build_parser():
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--data_parallel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use single-process nn.DataParallel on all visible CUDA devices when DDP is not active.",
+    )
     parser.add_argument("--save_dir", type=str, default="./work_dirs/simvp_spreadf")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--debug_ddp_timing_steps",
+        type=int,
+        default=0,
+        help=(
+            "When > 0, print per-rank fetch/h2d/forward/backward timing for the first N training "
+            "steps. Useful for locating DDP stalls."
+        ),
+    )
 
     return parser
 
@@ -950,7 +1015,14 @@ class VGGPerceptualLoss(nn.Module):
 
 def resolve_best_metric_mode(args):
     if args.best_metric_mode == "auto":
-        return "clarity" if uses_weighted_reconstruction_loss(args) else "combined"
+        if uses_weighted_reconstruction_loss(args):
+            return "clarity"
+        return "combined" if uses_local_branch_training(args) else "global"
+    if args.best_metric_mode in ("local", "combined") and not uses_local_branch_training(args):
+        raise ValueError(
+            f"best_metric_mode='{args.best_metric_mode}' requires --use_local_branch because local metrics "
+            "are disabled otherwise."
+        )
     return args.best_metric_mode
 
 
@@ -1073,7 +1145,49 @@ def resolve_train_loss_mode(args, loss_weights=None):
             f"{loss_weights['mse']:.4f}*MSE + "
             f"{loss_weights['perceptual']:.4f}*perceptual"
         )
-    return "lambda_global*global_l1 + lambda_local*local_l1"
+    recon_loss = get_local_reconstruction_loss(args)
+    local_branch_enabled = uses_local_branch_training(args)
+    if recon_loss == "hybrid":
+        if not local_branch_enabled:
+            return "lambda_global*(recon_mae_weight*global_mae + recon_mse_weight*global_mse)"
+        return (
+            "lambda_global*(recon_mae_weight*global_mae + recon_mse_weight*global_mse) + "
+            "lambda_local*(recon_mae_weight*local_mae + recon_mse_weight*local_mse)"
+        )
+    if recon_loss == "smooth_l1":
+        if not local_branch_enabled:
+            return "lambda_global*global_smooth_l1"
+        return "lambda_global*global_smooth_l1 + lambda_local*local_smooth_l1"
+    if not local_branch_enabled:
+        return f"lambda_global*global_{recon_loss}"
+    return f"lambda_global*global_{recon_loss} + lambda_local*local_{recon_loss}"
+
+
+def compute_local_reconstruction_loss(
+    args,
+    pred,
+    target,
+    mae_criterion,
+    mse_criterion,
+    smooth_l1_criterion,
+):
+    recon_loss = get_local_reconstruction_loss(args)
+    if recon_loss == "mae":
+        return mae_criterion(pred, target)
+    if recon_loss == "mse":
+        return mse_criterion(pred, target)
+    if recon_loss == "smooth_l1":
+        return smooth_l1_criterion(pred, target)
+
+    mae_weight = float(args.recon_mae_weight)
+    mse_weight = float(args.recon_mse_weight)
+    if mae_weight < 0 or mse_weight < 0:
+        raise ValueError(
+            f"recon_mae_weight and recon_mse_weight must be non-negative, got {mae_weight}, {mse_weight}."
+        )
+    if mae_weight == 0.0 and mse_weight == 0.0:
+        raise ValueError("recon_loss=hybrid requires recon_mae_weight or recon_mse_weight to be non-zero.")
+    return mae_weight * mae_criterion(pred, target) + mse_weight * mse_criterion(pred, target)
 
 
 def build_optimizer(args, model):
@@ -1140,6 +1254,14 @@ def get_world_size():
 
 def is_main_process():
     return get_rank() == 0
+
+
+def log_rank_debug(message: str, logger=None):
+    prefix = f"[rank {get_rank()}] "
+    if logger is not None and is_main_process():
+        logger.info(prefix + message)
+    else:
+        print(prefix + message, flush=True)
 
 
 def setup_distributed():
@@ -1572,10 +1694,17 @@ def main():
     else:
         device = torch.device("cpu")
     amp_enabled = args.amp and device.type == "cuda"
+    use_data_parallel = (
+        not use_ddp
+        and bool(args.data_parallel)
+        and device.type == "cuda"
+        and torch.cuda.device_count() > 1
+    )
 
     if is_main_process():
         logger.info(f"device: {device}")
         logger.info(f"amp_enabled: {amp_enabled}")
+        logger.info(f"use_data_parallel: {use_data_parallel}")
         logger.info(f"resolved_recipe: {resolve_recipe_tag(args)}")
         logger.info(f"resolved_optimizer: {args.opt}")
         logger.info(f"resolved_scheduler: {args.sched}")
@@ -1586,8 +1715,18 @@ def main():
             f"lambda_global: {args.lambda_global}  lambda_local: {args.lambda_local}  "
             f"local_crop: ({args.local_top}, {args.local_bottom})"
         )
+        logger.info(f"local_branch_training_enabled: {uses_local_branch_training(args)}")
+        logger.info(
+            f"recon_loss: {get_local_reconstruction_loss(args)}  "
+            f"smooth_l1_beta: {args.smooth_l1_beta}  "
+            f"recon_mae_weight: {args.recon_mae_weight}  recon_mse_weight: {args.recon_mse_weight}"
+        )
         logger.info(f"report_local_metrics: {args.report_local_metrics}")
         logger.info(f"best_metric_local_weight: {args.best_metric_local_weight}")
+        logger.info(
+            f"image_load_timeout_sec: {args.image_load_timeout_sec}  "
+            f"skip_bad_samples: {args.skip_bad_samples}  max_decode_retries: {args.max_decode_retries}"
+        )
         if args.arch == "simvp":
             logger.info(
                 f"simvp_model_type: {args.simvp_model_type}  "
@@ -1734,20 +1873,24 @@ def main():
                 f"predformer_loss: {args.predformer_loss}"
             )
 
-    # Local targets are always kept available because local metrics and best-model
-    # selection can depend on them even when local logging is disabled.
-    local_crop = (args.local_top, args.local_bottom)
+    local_crop = (args.local_top, args.local_bottom) if uses_local_branch_training(args) else None
     train_set = IonogramManifestDataset(
         manifest_path=args.train_manifest,
         image_mode=args.image_mode,
         image_size=args.image_size,
         local_crop=local_crop,
+        image_load_timeout_sec=args.image_load_timeout_sec,
+        skip_bad_samples=args.skip_bad_samples,
+        max_decode_retries=args.max_decode_retries,
     )
     val_set = IonogramManifestDataset(
         manifest_path=args.val_manifest,
         image_mode=args.image_mode,
         image_size=args.image_size,
         local_crop=local_crop,
+        image_load_timeout_sec=args.image_load_timeout_sec,
+        skip_bad_samples=args.skip_bad_samples,
+        max_decode_retries=args.max_decode_retries,
     )
 
     if is_main_process():
@@ -1887,16 +2030,29 @@ def main():
     ).to(device)
 
     ddp_find_unused_parameters = should_enable_ddp_find_unused_parameters(args)
+    ddp_static_graph = should_enable_ddp_static_graph(args)
     if use_ddp:
+        ddp_broadcast_buffers = not (str(args.arch).lower() == "hybrid_unet_facts")
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=ddp_find_unused_parameters,
+            broadcast_buffers=ddp_broadcast_buffers,
+            static_graph=ddp_static_graph,
         )
+    else:
+        ddp_broadcast_buffers = None
+        ddp_static_graph = None
+        if use_data_parallel:
+            model = nn.DataParallel(model)
+
+    if float(args.smooth_l1_beta) <= 0:
+        raise ValueError(f"smooth_l1_beta must be positive, but got {args.smooth_l1_beta}.")
 
     mae_criterion = nn.L1Loss()
     mse_criterion = nn.MSELoss()
+    smooth_l1_criterion = nn.SmoothL1Loss(beta=float(args.smooth_l1_beta))
     perceptual_criterion = None
     if uses_weighted_reconstruction_loss(args):
         perceptual_criterion = VGGPerceptualLoss(
@@ -1932,6 +2088,10 @@ def main():
     scheduler, scheduler_step_mode = build_lr_scheduler(args, optimizer, steps_per_epoch=len(train_loader))
     if is_main_process():
         logger.info(f"ddp_find_unused_parameters: {ddp_find_unused_parameters}")
+        logger.info(f"ddp_broadcast_buffers: {ddp_broadcast_buffers}")
+        logger.info(f"ddp_static_graph: {ddp_static_graph}")
+        if use_data_parallel:
+            logger.info(f"data_parallel_device_count: {torch.cuda.device_count()}")
         logger.info(f"optimizer_impl: {type(optimizer).__name__}")
         logger.info(f"scheduler_impl: {type(scheduler).__name__ if scheduler is not None else 'None'}")
     scaler = create_grad_scaler(device.type, amp_enabled)
@@ -1968,18 +2128,57 @@ def main():
             train_count = 0.0
             train_local_count = 0.0
 
-            iterator = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}") if is_main_process() else train_loader
+            train_steps = len(train_loader)
+            iterator = tqdm(range(train_steps), desc=f"epoch {epoch}/{args.epochs}") if is_main_process() else range(train_steps)
+            train_iter = iter(train_loader)
 
-            for x, y, x_local, y_local in iterator:
+            for step_idx in iterator:
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=fetch_start",
+                        logger=logger if is_main_process() else None,
+                    )
+                fetch_start_time = time.time()
+                try:
+                    x, y, x_local, y_local = next(train_iter)
+                except StopIteration:
+                    break
+                fetch_time = time.time() - fetch_start_time
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=fetch_done fetch={fetch_time:.3f}s",
+                        logger=logger if is_main_process() else None,
+                    )
+
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=h2d_start",
+                        logger=logger if is_main_process() else None,
+                    )
+                h2d_start_time = time.time()
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 if x_local is not None:
                     x_local = x_local.to(device, non_blocking=True)
                 if y_local is not None:
                     y_local = y_local.to(device, non_blocking=True)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                h2d_time = time.time() - h2d_start_time
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=h2d_done h2d={h2d_time:.3f}s",
+                        logger=logger if is_main_process() else None,
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
 
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=forward_start",
+                        logger=logger if is_main_process() else None,
+                    )
+                forward_start_time = time.time()
                 with get_amp_autocast(device.type, amp_enabled):
                     if uses_predrnnpp_openstl_recipe(args):
                         full_sequence = torch.cat([x, y], dim=1)
@@ -2056,18 +2255,47 @@ def main():
                     else:
                         pred = model(x, x_local=x_local, strict_local=args.use_local_branch)
                         if uses_local_reconstruction_loss(args):
+                            loss_global_recon = compute_local_reconstruction_loss(
+                                args=args,
+                                pred=pred,
+                                target=y,
+                                mae_criterion=mae_criterion,
+                                mse_criterion=mse_criterion,
+                                smooth_l1_criterion=smooth_l1_criterion,
+                            )
                             if y_local is not None:
                                 pred_local = crop_local_region(pred, args.local_top, args.local_bottom)
-                                loss_local = mae_criterion(pred_local, y_local)
+                                loss_local = compute_local_reconstruction_loss(
+                                    args=args,
+                                    pred=pred_local,
+                                    target=y_local,
+                                    mae_criterion=mae_criterion,
+                                    mse_criterion=mse_criterion,
+                                    smooth_l1_criterion=smooth_l1_criterion,
+                                )
                             else:
                                 loss_local = pred.new_zeros(())
-                            loss = args.lambda_global * mae_criterion(pred, y) + args.lambda_local * loss_local
+                            loss = args.lambda_global * loss_global_recon + args.lambda_local * loss_local
                         else:
                             loss_local = pred.new_zeros(())
 
                     loss_mae = mae_criterion(pred, y)
                     loss_mse = mse_criterion(pred, y)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                forward_time = time.time() - forward_start_time
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=forward_done forward={forward_time:.3f}s",
+                        logger=logger if is_main_process() else None,
+                    )
 
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=backward_step_start",
+                        logger=logger if is_main_process() else None,
+                    )
+                backward_step_start_time = time.time()
                 if uses_weighted_reconstruction_loss(args):
                     if loss_weights["perceptual"] > 0.0:
                         loss_perceptual = perceptual_criterion(pred.float(), y.float())
@@ -2120,7 +2348,32 @@ def main():
                     scheduler_step_mode=scheduler_step_mode,
                     amp_enabled=amp_enabled,
                 )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                backward_step_time = time.time() - backward_step_start_time
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        f"epoch={epoch} step={step_idx + 1}/{train_steps} stage=backward_step_done backward_step={backward_step_time:.3f}s",
+                        logger=logger if is_main_process() else None,
+                    )
                 global_step += 1
+
+                if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
+                    log_rank_debug(
+                        "epoch={} step={}/{} fetch={:.3f}s h2d={:.3f}s forward={:.3f}s backward_step={:.3f}s "
+                        "loss={:.6f} batch={}".format(
+                            epoch,
+                            step_idx + 1,
+                            train_steps,
+                            fetch_time,
+                            h2d_time,
+                            forward_time,
+                            backward_step_time,
+                            float(loss.item()),
+                            int(x.size(0)),
+                        ),
+                        logger=logger if is_main_process() else None,
+                    )
 
                 bs = x.size(0)
                 train_loss_sum += loss.item() * bs
@@ -2196,16 +2449,23 @@ def main():
                                 mae=f"{loss_mae.item():.6f}",
                                 mse=f"{loss_mse.item():.6f}",
                             )
-                    elif uses_simvp_moganet_openstl_loss(args):
+                elif uses_simvp_moganet_openstl_loss(args):
+                    iterator.set_postfix(
+                        loss=f"{loss.item():.6f}",
+                        mae=f"{loss_mae.item():.6f}",
+                    )
+                else:
+                    if uses_local_branch_training(args):
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
-                            mae=f"{loss_mae.item():.6f}",
+                            global_l1=f"{loss_mae.item():.6f}",
+                            local_l1=f"{loss_local.item():.6f}",
                         )
                     else:
                         iterator.set_postfix(
                             loss=f"{loss.item():.6f}",
                             global_l1=f"{loss_mae.item():.6f}",
-                            local_l1=f"{loss_local.item():.6f}",
+                            mse=f"{loss_mse.item():.6f}",
                         )
 
             train_loss_sum = reduce_sum_scalar(train_loss_sum, device)
@@ -2398,10 +2658,16 @@ def main():
                         f"simvp_model_type: {args.simvp_model_type}  simvp_recipe: {args.simvp_recipe}"
                     )
                 else:
-                    logger.info(
-                        f"train_loss: {train_loss:.4f}  train_loss_global: {train_loss_global:.4f}  "
-                        f"train_loss_local: {train_loss_local:.4f}"
-                    )
+                    if uses_local_branch_training(args):
+                        logger.info(
+                            f"train_loss: {train_loss:.4f}  train_loss_global: {train_loss_global:.4f}  "
+                            f"train_loss_local: {train_loss_local:.4f}"
+                        )
+                    else:
+                        logger.info(
+                            f"train_loss: {train_loss:.4f}  train_mae: {train_mae:.4f}  "
+                            f"train_mse: {train_mse:.4f}"
+                        )
                 logger.info(
                     f"val_mse: {val_mse:.4f}  val_perceptual: {val_perceptual:.4f}  "
                     f"val_psnr: {val_psnr:.4f}  val_ssim: {val_ssim:.4f}"
