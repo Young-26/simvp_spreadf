@@ -6,6 +6,7 @@ from .mim_model import MIM_Model
 from .model import SimVP
 from .predrnnpp_model import PredRNNpp_Model
 from .predrnnv2_model import PredRNNv2_Model
+from .spreadf_stpn import SpreadFSTPN
 from .tau_model import TAU_Model
 from .wrapper import SUPPORTED_ARCHS, SimVPForecast
 
@@ -34,5 +35,6 @@ __all__ = [
     "SUPPORTED_ARCHS",
     "SimVP",
     "SimVPForecast",
+    "SpreadFSTPN",
     "TAU_Model",
 ]

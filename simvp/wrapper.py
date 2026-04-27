@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 
 from .convlstm_model import ConvLSTM_Model
 from .earthfarseer_model import EarthFarseer_Model
-from .hybrid_unet_facts import HybridUNetFacTS
+from .spreadf_stpn import SpreadFSTPN
 from .mau_model import MAU_Model
 from .mim_model import MIM_Model
 from .model import SimVP
@@ -382,7 +382,7 @@ class SimVPForecast(nn.Module):
                 transformer_depth=predformer_transformer_depth,
             )
         elif self.arch == "hybrid_unet_facts":
-            self.backbone = HybridUNetFacTS(
+            self.backbone = SpreadFSTPN(
                 in_T=in_T,
                 out_T=out_T,
                 in_channels=C,

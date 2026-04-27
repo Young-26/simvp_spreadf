@@ -1788,7 +1788,7 @@ def main():
             )
         if args.arch == "hybrid_unet_facts":
             logger.info(
-                "hybrid_unet_facts uses a strict Fac-T-S translator, a cross-attention bottleneck forecaster, "
+                "hybrid_unet_facts runs SpreadF-STPN with FGST, a cross-attention bottleneck forecaster, "
                 "and lightweight temporal-conv skip forecasters."
             )
             logger.info(f"use_local_branch: {args.use_local_branch}")
@@ -2757,4 +2757,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
