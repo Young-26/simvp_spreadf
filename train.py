@@ -6,7 +6,8 @@ import sys
 import argparse
 import logging
 import traceback
-from contextlib import nullcontext
+import faulthandler
+from contextlib import nullcontext, suppress
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -34,6 +35,10 @@ from simvp.simvp_config import (
 from simvp.tau_model import tau_diff_div_reg
 from simvp.wrapper import SUPPORTED_ARCHS, SimVPForecast
 from utils.seed import set_seed
+
+
+def should_cuda_synchronize_for_timing(device) -> bool:
+    return device.type == "cuda" and os.environ.get("SIMVP_FORCE_CUDA_SYNC", "0") == "1"
 
 
 PREDFORMER_ARCHS = (
@@ -273,18 +278,12 @@ def get_default_weighted_reconstruction_loss_weights(args) -> dict:
 
 
 def should_enable_ddp_find_unused_parameters(args) -> bool:
-    # OpenSTL's PredRNN++ reference cell registers conv_o but does not consume it in forward().
-    # MIM likewise keeps OpenSTL's MIMN helper structure, whose conv_last parameters are registered
-    # but intentionally not consumed in the current forward path. DDP therefore needs unused-parameter
-    # detection for both ports to avoid reduction hangs on multi-GPU runs.
-    return is_predrnnpp_arch(args) or is_mim_arch(args)
+    arch = str(getattr(args, "arch", "")).lower()
+    return is_predrnnpp_arch(args) or is_mim_arch(args) or arch == "hybrid_unet_facts"
 
 
 def should_enable_ddp_static_graph(args) -> bool:
-    # hybrid_unet_facts runs with fixed tensor shapes and one stable parameter-usage pattern
-    # across iterations when use_local_branch is fixed for the whole run. Treat it as a
-    # static graph so DDP can skip per-iteration bucket rebuilding and unused-parameter scans.
-    return str(getattr(args, "arch", "")).lower() == "hybrid_unet_facts"
+    return False
 
 
 def resolve_recipe_tag(args) -> str:
@@ -1281,9 +1280,13 @@ def setup_distributed():
     return False, 0, 1, 0
 
 
-def cleanup_distributed():
+def cleanup_distributed(do_barrier: bool = False):
     if is_dist_avail_and_initialized():
-        dist.barrier()
+        if do_barrier:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
         dist.destroy_process_group()
 
 
@@ -1291,11 +1294,20 @@ def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def detach_metric_scalar(value, device):
+    if torch.is_tensor(value):
+        return value.detach().to(device=device, dtype=torch.float64)
+    return torch.tensor(float(value), dtype=torch.float64, device=device)
+
+
 def reduce_sum_scalar(value, device):
-    t = torch.tensor([value], dtype=torch.float64, device=device)
+    if torch.is_tensor(value):
+        t = value.detach().to(device=device, dtype=torch.float64).reshape(1)
+    else:
+        t = torch.tensor([value], dtype=torch.float64, device=device)
     if is_dist_avail_and_initialized():
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return t.item()
+    return float(t.item())
 
 
 def setup_logger(save_dir: str):
@@ -1663,6 +1675,11 @@ def main():
     args.train_loss_mode = resolve_train_loss_mode(args)
 
     use_ddp, rank, world_size, local_rank = setup_distributed()
+
+    if os.environ.get("SIMVP_DUMP_STACK_ON_HANG", "0") == "1":
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        dump_sec = int(os.environ.get("SIMVP_DUMP_STACK_SEC", "30"))
+        faulthandler.dump_traceback_later(dump_sec, repeat=True, file=sys.stderr)
     set_seed(args.seed + rank)
 
     if is_main_process():
@@ -2162,7 +2179,7 @@ def main():
                     x_local = x_local.to(device, non_blocking=True)
                 if y_local is not None:
                     y_local = y_local.to(device, non_blocking=True)
-                if device.type == "cuda":
+                if should_cuda_synchronize_for_timing(device):
                     torch.cuda.synchronize(device)
                 h2d_time = time.time() - h2d_start_time
                 if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
@@ -2281,7 +2298,7 @@ def main():
 
                     loss_mae = mae_criterion(pred, y)
                     loss_mse = mse_criterion(pred, y)
-                if device.type == "cuda":
+                if should_cuda_synchronize_for_timing(device):
                     torch.cuda.synchronize(device)
                 forward_time = time.time() - forward_start_time
                 if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
@@ -2348,7 +2365,7 @@ def main():
                     scheduler_step_mode=scheduler_step_mode,
                     amp_enabled=amp_enabled,
                 )
-                if device.type == "cuda":
+                if should_cuda_synchronize_for_timing(device):
                     torch.cuda.synchronize(device)
                 backward_step_time = time.time() - backward_step_start_time
                 if args.debug_ddp_timing_steps > 0 and step_idx < int(args.debug_ddp_timing_steps):
@@ -2376,97 +2393,49 @@ def main():
                     )
 
                 bs = x.size(0)
-                train_loss_sum += loss.item() * bs
-                train_loss_global_sum += loss_mae.item() * bs
-                train_mse_sum += loss_mse.item() * bs
-                train_perceptual_sum += loss_perceptual.item() * bs
-                train_diff_div_sum += loss_diff_div.item() * bs
-                train_count += bs
+                bs_metric = torch.tensor(float(bs), dtype=torch.float64, device=device)
+                train_loss_sum = train_loss_sum + detach_metric_scalar(loss, device) * bs_metric
+                train_loss_global_sum = train_loss_global_sum + detach_metric_scalar(loss_mae, device) * bs_metric
+                train_mse_sum = train_mse_sum + detach_metric_scalar(loss_mse, device) * bs_metric
+                train_perceptual_sum = train_perceptual_sum + detach_metric_scalar(loss_perceptual, device) * bs_metric
+                train_diff_div_sum = train_diff_div_sum + detach_metric_scalar(loss_diff_div, device) * bs_metric
+                train_count = train_count + bs_metric
                 if uses_local_reconstruction_loss(args) and y_local is not None:
-                    train_loss_local_sum += loss_local.item() * bs
-                    train_local_count += bs
+                    train_loss_local_sum = train_loss_local_sum + detach_metric_scalar(loss_local, device) * bs_metric
+                    train_local_count = train_local_count + bs_metric
 
-                if is_main_process():
+                if is_main_process() and os.environ.get("SIMVP_DISABLE_STEP_POSTFIX", "1") != "1":
                     if uses_weighted_reconstruction_loss(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mae=f"{loss_mae.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                            perceptual=f"{loss_perceptual.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif uses_predrnnpp_openstl_recipe(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mae=f"{loss_mae.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif uses_predrnnv2_openstl_loss(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mae=f"{loss_mae.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif uses_mim_openstl_loss(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mae=f"{loss_mae.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif uses_mau_internal_loss(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mae=f"{loss_mae.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif is_tau_arch(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                            diff_div=f"{loss_diff_div.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif (
                         uses_earthfarseer_openstl_loss(args)
                     ):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     elif uses_predformer_openstl_loss(args):
                         predformer_loss = get_predformer_loss(args)
                         if predformer_loss == "mae":
-                            iterator.set_postfix(
-                                loss=f"{loss.item():.6f}",
-                                mae=f"{loss_mae.item():.6f}",
-                            )
+                            pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                         elif predformer_loss == "mse":
-                            iterator.set_postfix(
-                                loss=f"{loss.item():.6f}",
-                                mse=f"{loss_mse.item():.6f}",
-                            )
+                            pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                         else:
-                            iterator.set_postfix(
-                                loss=f"{loss.item():.6f}",
-                                mae=f"{loss_mae.item():.6f}",
-                                mse=f"{loss_mse.item():.6f}",
-                            )
+                            pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                 elif uses_simvp_moganet_openstl_loss(args):
-                    iterator.set_postfix(
-                        loss=f"{loss.item():.6f}",
-                        mae=f"{loss_mae.item():.6f}",
-                    )
+                    pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                 else:
                     if uses_local_branch_training(args):
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            global_l1=f"{loss_mae.item():.6f}",
-                            local_l1=f"{loss_local.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
                     else:
-                        iterator.set_postfix(
-                            loss=f"{loss.item():.6f}",
-                            global_l1=f"{loss_mae.item():.6f}",
-                            mse=f"{loss_mse.item():.6f}",
-                        )
+                        pass  # disabled per-step tqdm postfix to avoid CUDA .item() sync in DDP
 
             train_loss_sum = reduce_sum_scalar(train_loss_sum, device)
             train_loss_global_sum = reduce_sum_scalar(train_loss_global_sum, device)
@@ -2726,8 +2695,11 @@ def main():
             traceback.print_exc()
 
     finally:
-        if is_dist_avail_and_initialized():
-            dist.barrier()
+        if is_dist_avail_and_initialized() and status == "FINISHED":
+            try:
+                dist.barrier()
+            except Exception:
+                pass
 
         if is_main_process():
             try:
@@ -2780,8 +2752,9 @@ def main():
                     f"Best score ({args.best_metric_mode}): {best_score:.6f}"
                 )
 
-        cleanup_distributed()
+        cleanup_distributed(do_barrier=(status == "FINISHED"))
 
 
 if __name__ == "__main__":
     main()
+
