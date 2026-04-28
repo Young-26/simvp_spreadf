@@ -692,7 +692,7 @@ class TAUTranslator(nn.Module):
 
 
 class FRegionResidualRefinementModule(nn.Module):
-    """Predict an image-domain residual for the fixed F-region crop."""
+    """Predict an image-domain residual for the fixed F-region crop with TAU-style modeling."""
 
     def __init__(
         self,
@@ -722,6 +722,15 @@ class FRegionResidualRefinementModule(nn.Module):
             ConvNormAct(in_channels, hidden_dim, kernel_size=3, stride=1),
             ResidualConvBlock(hidden_dim, hidden_dim),
         )
+        self.tau_translator = TAUTranslator(
+            in_T=in_T,
+            bottleneck_dim=hidden_dim,
+            depth=num_blocks,
+            kernel_size=21,
+            mlp_ratio=4.0,
+            dropout=dropout,
+            drop_path=dropout,
+        )
         self.history_forecast_head = TemporalConvForecastHead(
             in_T=in_T,
             out_T=out_T,
@@ -750,6 +759,7 @@ class FRegionResidualRefinementModule(nn.Module):
         history = self.history_encoder(
             x_local.reshape(batch_size * history_frames, channels, local_height, local_width)
         ).reshape(batch_size, history_frames, self.hidden_dim, local_height, local_width)
+        history = self.tau_translator(history)
         history_future = self.history_forecast_head(history)
 
         delta_feature = history_future.reshape(
