@@ -189,45 +189,6 @@ class MultiHeadSelfAttention(nn.Module):
         return x
 
 
-class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, attn_dropout: float):
-        super().__init__()
-        if dim % heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by heads={heads}.")
-
-        self.heads = heads
-        self.head_dim = dim // heads
-        self.scale = self.head_dim ** -0.5
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.attn_dropout = nn.Dropout(attn_dropout)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_dropout = nn.Dropout(attn_dropout)
-
-    def forward(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        batch_size, query_len, dim = query.shape
-        memory_len = memory.shape[1]
-
-        q = self.q_proj(query).reshape(batch_size, query_len, self.heads, self.head_dim)
-        k = self.k_proj(memory).reshape(batch_size, memory_len, self.heads, self.head_dim)
-        v = self.v_proj(memory).reshape(batch_size, memory_len, self.heads, self.head_dim)
-
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_dropout(attn)
-
-        x = torch.matmul(attn, v)
-        x = x.transpose(1, 2).reshape(batch_size, query_len, dim)
-        x = self.proj(x)
-        x = self.proj_dropout(x)
-        return x
-
-
 class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, dropout: float):
         super().__init__()
@@ -351,60 +312,6 @@ class FactorizedGatedSpatiotemporalTransformer(nn.Module):
         spatial_tokens = self.spatial_transformer(spatial_tokens)
         x = spatial_tokens.reshape(batch_size, num_frames, height, width, channels).permute(0, 1, 4, 2, 3)
         return x
-
-
-class FutureCrossAttentionHead(nn.Module):
-    def __init__(
-        self,
-        in_T: int,
-        out_T: int,
-        dim: int,
-        heads: int,
-        attn_dropout: float = 0.1,
-        ffn_ratio: float = 2.0,
-        ffn_dropout: float = 0.1,
-        drop_path: float = 0.0,
-    ):
-        super().__init__()
-        if in_T <= 0 or out_T <= 0:
-            raise ValueError(f"FutureCrossAttentionHead expects positive in_T/out_T, got {in_T}, {out_T}.")
-
-        self.in_T = in_T
-        self.out_T = out_T
-        self.dim = dim
-        self.query_embed = nn.Parameter(torch.randn(1, out_T, dim) * (dim ** -0.5))
-        self.query_norm = nn.LayerNorm(dim)
-        self.memory_norm = nn.LayerNorm(dim)
-        self.cross_attn = MultiHeadCrossAttention(dim=dim, heads=heads, attn_dropout=attn_dropout)
-        self.cross_drop = DropPath(drop_path)
-        self.ffn_norm = nn.LayerNorm(dim)
-        self.ffn = SwiGLUFeedForward(dim=dim, hidden_dim=int(dim * ffn_ratio), dropout=ffn_dropout)
-        self.ffn_drop = DropPath(drop_path)
-        self.register_buffer(
-            "future_temporal_pos_embed",
-            sinusoidal_embedding(out_T, dim),
-            persistent=False,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, num_frames, channels, height, width = x.shape
-        if num_frames != self.in_T:
-            raise ValueError(f"Expected {self.in_T} temporal tokens, but got {num_frames}.")
-        if channels != self.dim:
-            raise ValueError(f"Expected channel dim {self.dim}, but got {channels}.")
-
-        # Each spatial location keeps its own temporal memory:
-        # [B, T, C, H, W] -> [B * H * W, T, C]
-        memory = x.permute(0, 3, 4, 1, 2).reshape(batch_size * height * width, num_frames, channels)
-        queries = self.query_embed + self.future_temporal_pos_embed.to(dtype=memory.dtype)
-        queries = queries.expand(memory.size(0), -1, -1)
-
-        future = queries + self.cross_drop(self.cross_attn(self.query_norm(queries), self.memory_norm(memory)))
-        future = future + self.ffn_drop(self.ffn(self.ffn_norm(future)))
-
-        # [B * H * W, out_T, C] -> [B, out_T, C, H, W]
-        future = future.reshape(batch_size, height, width, self.out_T, channels).permute(0, 3, 4, 1, 2)
-        return future
 
 
 class TemporalConvForecastHead(nn.Module):
@@ -834,28 +741,6 @@ class SpreadFSTPN(nn.Module):
             ffn_dropout=ffn_dropout,
             drop_path=drop_path,
         )
-        self.bottleneck_future_head = FutureCrossAttentionHead(
-            in_T=in_T,
-            out_T=out_T,
-            dim=self.stage_dims[-1],
-            heads=_resolve_num_heads(self.stage_dims[-1], heads),
-            attn_dropout=attn_dropout,
-            ffn_ratio=max(2.0, ffn_ratio / 2.0),
-            ffn_dropout=ffn_dropout,
-            drop_path=drop_path,
-        )
-        self.skip_future_heads = nn.ModuleList(
-            [
-                TemporalConvForecastHead(
-                    in_T=in_T,
-                    out_T=out_T,
-                    dim=skip_dim,
-                    kernel_size=3,
-                    dropout=ffn_dropout,
-                )
-                for skip_dim in self.stage_dims[:-1]
-            ]
-        )
         self.decoder = FrameDecoder(stage_dims=self.stage_dims, out_channels=in_channels)
 
         if self.use_local_branch:
@@ -897,13 +782,7 @@ class SpreadFSTPN(nn.Module):
         fused[:, :, :, top:bottom, :] = local_seq
         return fused
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        x_local: Optional[torch.Tensor] = None,
-        return_aux: bool = False,
-        strict_local: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+    def _predict_equal_length(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, num_frames, channels, height, width = x.shape
         if num_frames != self.in_T:
             raise ValueError(f"Expected {self.in_T} input frames, but got {num_frames}.")
@@ -933,26 +812,41 @@ class SpreadFSTPN(nn.Module):
         bottleneck = bottleneck + self.spatial_pos_embed.to(dtype=bottleneck.dtype)
         bottleneck = self.translator(bottleneck)
 
-        # Translator keeps equal-length hidden states. Future forecasting starts here.
-        future_bottleneck = self.bottleneck_future_head(bottleneck)
-        future_skips = [
-            head(skip)
-            for head, skip in zip(self.skip_future_heads, skips)
-        ]
-
-        future_bottleneck = future_bottleneck.reshape(
-            batch_size * self.out_T,
+        decoded_bottleneck = bottleneck.reshape(
+            batch_size * self.in_T,
             self.stage_dims[-1],
             self.bottleneck_height,
             self.bottleneck_width,
         )
         decoded_skips = [
-            skip.reshape(batch_size * self.out_T, skip.size(2), skip.size(3), skip.size(4))
-            for skip in future_skips
+            skip.reshape(batch_size * self.in_T, skip.size(2), skip.size(3), skip.size(4))
+            for skip in skips
         ]
 
-        global_pred = self.decoder(future_bottleneck, decoded_skips)
-        global_pred = global_pred.reshape(batch_size, self.out_T, self.in_channels, height, width)
+        equal_pred = self.decoder(decoded_bottleneck, decoded_skips)
+        return equal_pred.reshape(batch_size, self.in_T, self.in_channels, height, width)
+
+    def _predict_target_length(self, x: torch.Tensor) -> torch.Tensor:
+        if self.out_T <= self.in_T:
+            return self._predict_equal_length(x)[:, : self.out_T]
+
+        pred_chunks: List[torch.Tensor] = []
+        cur_seq = x
+        generated = 0
+        while generated < self.out_T:
+            cur_seq = self._predict_equal_length(cur_seq)
+            pred_chunks.append(cur_seq)
+            generated += cur_seq.size(1)
+        return torch.cat(pred_chunks, dim=1)[:, : self.out_T]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_local: Optional[torch.Tensor] = None,
+        return_aux: bool = False,
+        strict_local: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        global_pred = self._predict_target_length(x)
 
         aux_outputs: dict[str, torch.Tensor] = {}
         final_pred = global_pred
